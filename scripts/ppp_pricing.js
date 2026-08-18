@@ -122,8 +122,36 @@ const decode = id => JSON.parse(Buffer.from(id, 'base64').toString());
 /** Apple's price index is global: a price point ID can be forged for any product. */
 const forge = (sub, terr, p) => Buffer.from(JSON.stringify({ s: String(sub), t: terr, p: String(p) })).toString('base64').replace(/=+$/, '');
 
-const fetchJson = url => new Promise((res, rej) => {
-    https.get(url, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => { try { res(JSON.parse(d)); } catch (e) { rej(new Error('unreadable response')); } }); }).on('error', rej);
+/**
+ * The World Bank hands out an HTML error page under load, and https.get follows no
+ * redirect and checks no status code. All of it used to surface as "unreadable response",
+ * with no URL and no body — which sends you looking in the wrong place entirely.
+ * Retry the transient failures, and when the last attempt gives up, say what came back.
+ */
+const fetchJson = (url, tries = 3) => new Promise((res, rej) => {
+    const retry = (left, e) => {
+        if (left <= 1) return rej(e);
+        setTimeout(() => attempt(left - 1, url, 3), 1500 * (tries - left + 1));
+    };
+    const attempt = (left, target, hops) => {
+        https.get(target, { headers: { 'user-agent': 'appstore-ppp-pricing', accept: 'application/json' } }, r => {
+            if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location && hops > 0) {
+                r.resume();
+                return attempt(left, new URL(r.headers.location, target).toString(), hops - 1);
+            }
+            let d = '';
+            r.on('data', c => d += c);
+            r.on('end', () => {
+                try {
+                    if (r.statusCode < 200 || r.statusCode >= 300) throw new Error(`HTTP ${r.statusCode}`);
+                    res(JSON.parse(d.replace(/^\uFEFF/, '')));   // the API sometimes leads with a BOM
+                } catch (e) {
+                    retry(left, new Error(`${target.slice(0, 100)}… → ${e.message}; body: ${JSON.stringify(d.slice(0, 200))}`));
+                }
+            });
+        }).on('error', e => retry(left, e));
+    };
+    attempt(tries, url, 3);
 });
 
 // ───────────────────────────────────────────────────────────────── commands
@@ -154,15 +182,27 @@ async function cmdInit() {
         : (await getAll('/v1/territories?limit=200', jwt)).data.map(t => t.id);
 
     const countries = [...new Set([ref, ...territories])];
-    console.log(`World Bank — ${countries.length} territories…`);
+
+    // The World Bank rejects the entire request when a single code is unknown to it, and
+    // Apple sells in territories it doesn't track (Kosovo, Anguilla, the Vatican…). One bad
+    // code out of 175 therefore looked exactly like "no data for your reference country".
+    // Ask for its own country list first, and only ever query the intersection — the
+    // untracked territories fall through to the existing "skipped" count, untouched.
+    const known = new Set((((await fetchJson('https://api.worldbank.org/v2/country?format=json&per_page=400'))[1]) || []).map(c => c.id));
+    const queryable = countries.filter(c => known.has(c));
+    console.log(`World Bank — ${queryable.length} of ${countries.length} territories tracked…`);
+    if (!known.has(ref)) { console.error(`❌ the World Bank has no country ${ref} — check the ISO-3 code of your reference territory`); process.exit(1); }
 
     const indicator = async (code, mrv) => {
-        const r = await fetchJson(`https://api.worldbank.org/v2/country/${countries.join('%3B')}/indicator/${code}?format=json&mrv=${mrv}&per_page=2000`);
         const o = {};
-        for (const x of (r[1] || [])) {
-            if (x.value == null) continue;
-            const c = x.countryiso3code;
-            if (!o[c] || x.date > o[c].year) o[c] = { v: x.value, year: x.date, name: x.country.value };
+        for (let i = 0; i < queryable.length; i += 60) {   // keep the URL to a sane length
+            const batch = queryable.slice(i, i + 60).join('%3B');
+            const r = await fetchJson(`https://api.worldbank.org/v2/country/${batch}/indicator/${code}?format=json&mrv=${mrv}&per_page=2000`);
+            for (const x of (r[1] || [])) {
+                if (x.value == null) continue;
+                const c = x.countryiso3code;
+                if (!o[c] || x.date > o[c].year) o[c] = { v: x.value, year: x.date, name: x.country.value };
+            }
         }
         return o;
     };
