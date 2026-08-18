@@ -215,8 +215,10 @@ writing their own:
 
 - `SubscriptionPriceCreateRequest` has three attributes and all three matter: `planType`
   (without it, a product with several payment plans gets its price on the wrong one),
-  `preserveCurrentPrice`, and `startDate` — **required, and at least one day in the future**
-  (at `null`, Apple reads it as "initial price" and rejects any already-approved product).
+  `preserveCurrentPrice`, and `startDate` — **required, and at least three days out**. At
+  `null`, Apple reads it as "initial price" and rejects any already-approved product; at
+  tomorrow it answers 409 `ENTITY_ERROR.RELATIONSHIP.INVALID`, "Invalid startDate", which
+  reads like a malformed date and is really a deadline. Three days is verified to work.
 - Apple's price index is **global**: the `p` field in a price point's base64 ID doesn't
   depend on the subscription, so an ID can be forged for any product. One territory grid,
   loaded once, serves every product.

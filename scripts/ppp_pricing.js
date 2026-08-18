@@ -394,8 +394,11 @@ async function cmdPlan(write) {
     if (!write) { console.log('\nNothing was changed. Re-run with "apply" once the plan looks right.'); return; }
 
     // Three attributes, and all three matter — see SKILL.md.
-    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
-    const startDate = cfg.effective_date || tomorrow;
+    // "At least one day in the future" is what the error message implies, and it is wrong:
+    // tomorrow is rejected with 409 ENTITY_ERROR.RELATIONSHIP.INVALID, "Invalid startDate".
+    // Three days out is accepted. The old default therefore failed every single write.
+    const soon = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
+    const startDate = cfg.effective_date || soon;
     let ok = 0, failed = 0;
     for (const r of todo) {
         const res = await call('POST', '/v1/subscriptionPrices', jwt, {
@@ -411,7 +414,7 @@ async function cmdPlan(write) {
         if (res.s === 200 || res.s === 201) { ok++; process.stdout.write('.'); }
         else {
             failed++;
-            console.log(`\n❌ ${r.subId} ${r.territory} ${r.planType} → ${res.s} ${JSON.stringify(res.d).slice(0, 240)}`);
+            console.log(`\n❌ ${r.subId} ${r.territory} ${r.planType} → ${res.s} ${JSON.stringify(res.d).slice(0, 600)}`);
             if (res.s === 403) { console.error('\nThis key cannot write prices: App Manager or Admin role required.'); break; }
         }
         await new Promise(s => setTimeout(s, 250));
