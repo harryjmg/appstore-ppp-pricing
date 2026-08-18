@@ -88,12 +88,21 @@ anything is written — in your own language.
 
 ```bash
 cd scripts
-node ppp_pricing.js products                              # list your subscriptions
-node ppp_pricing.js init --products=<id>,<id> --ref=USA   # build the config
-node ppp_pricing.js init --products=<id> --ref=USA --no-marketing   # ... in strict PPP
-node ppp_pricing.js plan                                  # dry run — writes nothing
-node ppp_pricing.js apply                                 # write
+node ppp_pricing.js products                            # list your subscriptions
+node ppp_pricing.js run --products=<id> --ref=USA       # build + simulate, writes nothing
+node ppp_pricing.js bounds --floor=0.40 --freeze=DEU    # revise a decision, offline
+node ppp_pricing.js rollout --canary=<territory>        # write: one territory, then the rest
+node ppp_pricing.js verify                              # read the prices back
 ```
+
+`run` never writes and `bounds` never touches the network, so the whole exploration —
+raise the floor, freeze a neighbour, look again — costs seconds and no API calls. The
+unclamped index is stored at build time precisely so a bound can be replayed offline, and
+territories you add to the config by hand survive every replay. Only `rollout` and `apply`
+write to the App Store.
+
+Under the four-step flow, each decision is also a flag: `--floor`, `--cap`,
+`--no-increases`, `--freeze=A,B`, `--no-marketing`, `--marketing-pull`.
 
 ## Requirements
 

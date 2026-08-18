@@ -227,6 +227,7 @@ async function cmdInit() {
         const damped = Math.sqrt((gni[t].v * share) / baseline);
         out[t] = {
             index: Number(Math.min(cap, Math.max(floor, damped)).toFixed(3)),
+            damped: Number(damped.toFixed(4)),   // unclamped: lets `bounds` replay offline
             gni_ppp: gni[t].v, top_decile_share: share,
             decile_source: decile[t] ? String(decile[t].year) : 'fallback',
             bound: damped < floor ? 'floor' : damped > cap ? 'cap' : null,
@@ -240,6 +241,7 @@ async function cmdInit() {
         marketing_rounding: { enabled: marketing, pull_pct: parseFloat(opt('marketing-pull', '8')) },
         effective_date: null,
         plan_types: ['UPFRONT', 'MONTHLY'],
+        frozen: [],
         subscriptions: products.map(id => ({ asc_id: id })),
         territories: out,
     };
@@ -308,11 +310,12 @@ function pickPricePoint(grid, target, cfg) {
     return pick;
 }
 
-async function buildPlan(jwt, cfg) {
+async function buildPlan(jwt, cfg, restrict = null) {
     const cache = fs.existsSync(CACHE) ? JSON.parse(fs.readFileSync(CACHE, 'utf8')) : {};
     const ref = cfg.reference.territory;
-    const only = opt('territory') ? opt('territory').split(',') : null;
+    const only = restrict || (opt('territory') ? opt('territory').split(',') : null);
     const rows = [];
+    const unpriced = new Set();
 
     for (const sub of cfg.subscriptions) {
         if (sub.skip) { console.log(`⏭️  ${sub.asc_id} skipped — ${sub.skip}`); continue; }
@@ -343,7 +346,9 @@ async function buildPlan(jwt, cfg) {
             for (const e of eq.data) base[decode(e.id).t] = parseFloat(e.attributes.customerPrice);
 
             for (const [terr, conf] of Object.entries(cfg.territories)) {
-                if (base[terr] == null) continue;
+                // Apple returns no equalization for a territory it cannot sell this product
+                // in. Silently skipping it is how you end up believing a country is covered.
+                if (base[terr] == null) { unpriced.add(terr); continue; }
                 if (only && !only.includes(terr)) continue;
                 const target = base[terr] * conf.index;
 
@@ -371,18 +376,17 @@ async function buildPlan(jwt, cfg) {
         }
     }
     fs.writeFileSync(CACHE, JSON.stringify(cache));
-    return rows;
+    return { rows, unpriced: [...unpriced] };
 }
 
-async function cmdPlan(write) {
-    if (!fs.existsSync(PPP_CONFIG)) { console.error('❌ ppp_config.json is missing. Run: node ppp_pricing.js init'); process.exit(1); }
-    const cfg = JSON.parse(fs.readFileSync(PPP_CONFIG, 'utf8'));
+async function cmdPlan(write, restrict = null) {
+    const cfg = readCfg();
     const { jwt } = token();
 
     console.log(write ? '🔴 WRITING' : '🔵 Dry run — nothing will be written');
     console.log(`   reference ${cfg.reference.territory} · existing subscribers: ${cfg.preserve_current_price ? 'price preserved' : '⚠️ NOT preserved'}\n`);
 
-    const rows = await buildPlan(jwt, cfg);
+    const { rows, unpriced } = await buildPlan(jwt, cfg, restrict);
     const todo = rows.filter(r => r.change).sort((a, b) => b.delta - a.delta);
 
     for (const r of todo) {
@@ -390,6 +394,10 @@ async function cmdPlan(write) {
         console.log(`   ${r.territory.padEnd(5)} ${r.planType.toLowerCase().padEnd(8)} ${String(r.currentPrice).padStart(10)} → ${String(r.newPrice).padStart(10)} ${d.padStart(7)}   ×${r.index}${r.bound ? ' (' + r.bound + ')' : ''}`);
     }
     console.log(`\n${todo.length} price(s) to write · ${todo.filter(r => r.delta > 0).length} increase(s) · ${todo.filter(r => r.delta < 0).length} decrease(s)`);
+    if (unpriced.length) {
+        console.log(`\n⚠️  ${unpriced.length} territory(ies) in your config have no Apple price equalization`);
+        console.log(`   and can never be written — Apple doesn't sell this product there: ${unpriced.join(', ')}`);
+    }
 
     if (!write) { console.log('\nNothing was changed. Re-run with "apply" once the plan looks right.'); return; }
 
@@ -422,15 +430,123 @@ async function cmdPlan(write) {
     console.log(`\n\n✅ ${ok} written${failed ? ` · ❌ ${failed} failed` : ''} — effective ${startDate}`);
 }
 
+function readCfg() {
+    if (!fs.existsSync(PPP_CONFIG)) { console.error('❌ ppp_config.json is missing. Run: node ppp_pricing.js init'); process.exit(1); }
+    return JSON.parse(fs.readFileSync(PPP_CONFIG, 'utf8'));
+}
+
+/**
+ * Re-clamp every index from the unclamped value stored at init.
+ *
+ * A floor, a cap and a freeze are decisions, not measurements. Replaying one shouldn't
+ * mean asking the World Bank again — and above all shouldn't drop the territories someone
+ * added by hand, which is precisely what re-running `init` does.
+ */
+function reindex(cfg) {
+    const { floor, cap } = cfg.bounds;
+    const frozen = new Set(cfg.frozen || []);
+    let manual = 0;
+    for (const [t, v] of Object.entries(cfg.territories)) {
+        if (frozen.has(t)) { v.index = 1; v.bound = 'frozen'; continue; }
+        if (v.damped == null) { manual++; continue; }   // hand-written: left exactly as found
+        v.index = Number(Math.min(cap, Math.max(floor, v.damped)).toFixed(3));
+        v.bound = v.damped < floor ? 'floor' : v.damped > cap ? 'cap' : null;
+    }
+    return { manual, frozen: frozen.size };
+}
+
+/**
+ * Move the bounds without touching the network. The decisions that actually shape the
+ * outcome — how low, how high, which territories never move — are the ones you revise
+ * three times while reading the table, so they must cost a second, not a re-index.
+ */
+function cmdBounds() {
+    const cfg = readCfg();
+    if (opt('floor') != null) cfg.bounds.floor = parseFloat(opt('floor'));
+    if (opt('cap') != null) cfg.bounds.cap = parseFloat(opt('cap'));
+    if (args.includes('--no-increases')) cfg.bounds.cap = 1;
+    const freeze = opt('freeze');
+    if (freeze != null) {
+        cfg.frozen = freeze === 'none' ? []
+            : [...new Set([...(cfg.frozen || []), ...freeze.split(',').filter(Boolean)])];
+    }
+    const { manual, frozen } = reindex(cfg);
+    fs.writeFileSync(PPP_CONFIG, JSON.stringify(cfg, null, 2));
+
+    const v = Object.values(cfg.territories);
+    console.log(`✅ floor ${cfg.bounds.floor} · cap ${cfg.bounds.cap} · ${v.filter(x => x.bound === 'floor').length} at the floor · `
+        + `${v.filter(x => x.bound === 'cap').length} at the cap · ${frozen} frozen`
+        + (manual ? ` · ${manual} hand-written, left as is` : ''));
+    console.log('   Then: node ppp_pricing.js plan');
+}
+
+/**
+ * Read the prices back. A dot on stdout is not proof that Apple stored anything —
+ * this is. Exits non-zero while anything is still off target, so the quarterly cron
+ * the skill asks for can actually fail.
+ */
+async function cmdVerify() {
+    const cfg = readCfg();
+    const { jwt } = token();
+    const { rows, unpriced } = await buildPlan(jwt, cfg);
+    const pending = rows.filter(r => r.change);
+    console.log(`${rows.length - pending.length} of ${rows.length} price(s) on target.`);
+    for (const r of pending) {
+        console.log(`   ${r.territory.padEnd(5)} ${r.planType.toLowerCase().padEnd(8)} ${String(r.currentPrice).padStart(10)} → ${String(r.newPrice).padStart(10)}  still to write`);
+    }
+    if (unpriced.length) console.log(`\n⚠️  ${unpriced.length} territory(ies) Apple cannot price: ${unpriced.join(', ')}`);
+    if (pending.length) process.exitCode = 1;
+}
+
+/**
+ * Build, bound and simulate in one call. Every decision is a flag, so nothing stops
+ * halfway to ask a question — this is the form an agent can drive end to end instead
+ * of handing you five commands to type.
+ *
+ * `run` never writes, and that is the point: a command that cannot write can be granted
+ * once and for all, while `rollout` stays a deliberate act. Splitting them is what makes
+ * "hands-off up to the plan, hands-on to write" expressible as a permission rule.
+ */
+async function cmdRun() {
+    if (!fs.existsSync(PPP_CONFIG) || args.includes('--fresh')) await cmdInit();
+    else console.log('ppp_config.json already exists — reusing it (--fresh rebuilds it).');
+
+    if (['floor', 'cap', 'freeze'].some(f => opt(f) != null) || args.includes('--no-increases')) cmdBounds();
+
+    await cmdPlan(false);
+    console.log('\nRead the table. Then: node ppp_pricing.js rollout --canary=<territory>');
+}
+
+/** Write: one canary territory, then the rest, then read the prices back. */
+async function cmdRollout() {
+    const canary = opt('canary');
+    if (canary) {
+        console.log(`── canary: ${canary} ──`);
+        await cmdPlan(true, [canary]);
+        console.log('\n── rolling out ──');
+    }
+    await cmdPlan(true);
+    await cmdVerify();
+}
+
 const commands = {
     products: cmdProducts,
     init: cmdInit,
+    bounds: cmdBounds,
     plan: () => cmdPlan(false),
     apply: () => cmdPlan(true),
+    verify: cmdVerify,
+    run: cmdRun,
+    rollout: cmdRollout,
 };
 
 if (!commands[command]) {
-    console.log('Usage: node ppp_pricing.js <products|init|plan|apply> [options]');
+    console.log('Usage: node ppp_pricing.js <run|rollout|products|init|bounds|plan|apply|verify> [options]');
+    console.log('  run   --products=id,id --ref=USA   build + bound + simulate. Never writes.');
+    console.log('        [--floor= --cap= --freeze=]  decisions, applied before the plan');
+    console.log('        [--fresh]                    rebuild the config from scratch');
+    console.log('  rollout [--canary=XXX]          write: one territory first, then the rest,');
+    console.log('                                  then read the prices back');
     console.log('  products                        list the account\'s subscriptions');
     console.log('  init --products=id,id --ref=USA build ppp_config.json');
     console.log('       [--territories=all|A,B]    default: every App Store territory');
@@ -438,8 +554,13 @@ if (!commands[command]) {
     console.log('       [--no-marketing]           keep the closest price point instead of');
     console.log('                                  snapping to a familiar anchor (39.99 vs 38.99)');
     console.log('       [--marketing-pull=8]       how far, in %, snapping may drift');
+    console.log('  bounds [--floor= --cap=]        replay the bounds offline, keeping');
+    console.log('         [--freeze=A,B|none]      hand-written territories intact');
+    console.log('         [--no-increases]         cap at 1.0: nothing goes up');
     console.log('  plan  [--territory=A,B]         dry run');
     console.log('  apply [--territory=A,B]         write prices');
+    console.log('  verify                          read the prices back; non-zero if off target');
     process.exit(command ? 1 : 0);
 }
-commands[command]().catch(e => { console.error('❌', e.message); process.exit(1); });
+// bounds is synchronous; wrap so the dispatch doesn't depend on which ones are async.
+Promise.resolve(commands[command]()).catch(e => { console.error('❌', e.message); process.exit(1); });

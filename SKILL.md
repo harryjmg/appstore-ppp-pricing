@@ -1,6 +1,13 @@
 ---
 name: appstore-ppp-pricing
 description: Adjust App Store subscription prices to each country's purchasing power. Walks the user through the decisions that actually determine the outcome (how low to go, whether to raise prices, who gets affected), then writes the prices through the App Store Connect API. Use when someone wants regional pricing, PPP pricing, per-country prices, or says their price is out of reach in some markets.
+allowed-tools:
+  - Bash(node ppp_pricing.js products:*)
+  - Bash(node ppp_pricing.js init:*)
+  - Bash(node ppp_pricing.js bounds:*)
+  - Bash(node ppp_pricing.js plan:*)
+  - Bash(node ppp_pricing.js verify:*)
+  - Bash(node ppp_pricing.js run:*)
 ---
 
 # App Store pricing by purchasing power
@@ -15,6 +22,37 @@ conversion with a **purchasing-power multiplier**, country by country.
 
 The tool is `scripts/ppp_pricing.js` (no npm dependencies). What follows are the
 **decisions** — that's where the outcome is decided, not in the plumbing.
+
+---
+
+## Run it first, ask second
+
+**Simulate before asking the user anything.** Every decision below has a default, and `run`
+writes nothing — so there is no reason to make someone judge seven abstractions before a
+single number is on screen. Run it from the `scripts/` directory:
+
+```bash
+node ppp_pricing.js run --products=<id>,<id> --ref=<ISO3>
+```
+
+Then show the table, then ask. In that order, for one reason: **the question worth asking is
+usually not in this file — it's in the table.** On a real account, the decision that mattered
+was three eurozone neighbours landing 13% to 25% above the reference country in the same
+currency, directly comparable by any user who crosses a border. No questionnaire surfaces
+that. Row 14 of the plan does.
+
+Every decision is a flag, so revising one costs a second and never touches the network:
+
+| Decision | Flag |
+|---|---|
+| how low — the floor (3) | `--floor=0.40` |
+| how high, or not at all (5) | `--cap=1.20`, `--no-increases` |
+| leave a territory where it is | `--freeze=DEU,IRL` (`--freeze=none` clears the list) |
+| calculated vs marketing price (4) | `--no-marketing`, `--marketing-pull=8` |
+
+`bounds` replays those offline, and **territories added by hand survive it**. Never re-run
+`init` to change a bound: it rebuilds from the World Bank and silently drops anything
+hand-written, which is a slow way to lose a decision you already made.
 
 ---
 
@@ -179,17 +217,24 @@ included) and applies the index to it. No exchange rate is ever handled.
 ## Procedure
 
 ```bash
-node ppp_pricing.js products                              # 1. list subscriptions
-node ppp_pricing.js init --products=<id>,<id> --ref=USA   # 2. build the config
-                                                          #    (+ --no-marketing for strict PPP)
-node ppp_pricing.js plan                                  # 3. simulate — READ the table
-node ppp_pricing.js apply --territory=<one test country>  # 4. one canary territory
-node ppp_pricing.js apply                                 # 5. roll out
+node ppp_pricing.js products                            # 1. what is actually on sale
+node ppp_pricing.js run --products=<id> --ref=<ISO3>    # 2. build + simulate, writes nothing
+node ppp_pricing.js bounds --floor=0.40 --freeze=DEU    # 3. revise, offline, as often as needed
+node ppp_pricing.js rollout --canary=<small territory>  # 4. one territory, then the rest
+node ppp_pricing.js verify                              # 5. read the prices back
 ```
 
-Read the step-3 table line by line before applying — it's the only moment an index mistake is
-visible. Then write **one** low-stakes territory, read the price back from the API, and only
-then roll out.
+Read the step-2 table line by line — it's the only moment an index mistake is visible. Step 3
+is where the conversation actually happens, and it costs nothing to repeat.
+
+**`run` never writes; `rollout` and `apply` do.** That split is why this skill pre-approves
+`run`, `plan`, `bounds` and `verify` in its `allowed-tools` and deliberately leaves the two
+writing commands out: everything up to the plan should be hands-off, and pushing prices to a
+live App Store should cost a deliberate approval. Don't "fix" that by adding them.
+
+`verify` reads the prices back and exits non-zero while anything is off target — a dot on
+stdout is not proof that Apple stored anything. It's also what makes the quarterly re-run of
+decision 7 something a cron can fail on.
 
 Prerequisite: an App Store Connect API key with the **App Manager** or **Admin** role (Users
 and Access → Integrations). A reporting key is not enough — it reads prices fine, then takes
