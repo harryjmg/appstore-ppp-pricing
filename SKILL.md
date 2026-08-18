@@ -1,205 +1,202 @@
 ---
 name: appstore-ppp-pricing
-description: Adapter les prix d'abonnement App Store au pouvoir d'achat de chaque pays. Guide les décisions (jusqu'où baisser, faut-il monter, qui est impacté) puis applique les prix via l'API App Store Connect. À utiliser quand quelqu'un veut du pricing régional, du PPP, des prix par pays, ou trouve que son prix est hors de portée dans certains marchés.
+description: Adjust App Store subscription prices to each country's purchasing power. Walks the user through the decisions that actually determine the outcome (how low to go, whether to raise prices, who gets affected), then writes the prices through the App Store Connect API. Use when someone wants regional pricing, PPP pricing, per-country prices, or says their price is out of reach in some markets.
 ---
 
-# Prix App Store par pouvoir d'achat
+# App Store pricing by purchasing power
 
-Apple convertit déjà votre prix dans les 175 territoires — mais au taux de change. Résultat :
-un abonnement à 49,99 € reste à ~45 $ au Maroc ou au Sénégal, soit plusieurs fois ce que
-la population solvable de ces pays paie pour un abonnement numérique. Ce skill remplace la
-conversion par un multiplicateur de pouvoir d'achat, pays par pays.
+**Speak the user's language.** This file is in English for maintenance; conduct the
+conversation in whatever language the user writes to you in.
 
-Le code est dans `scripts/ppp_pricing.js` (zéro dépendance npm). Ce qui suit, ce sont les
-**décisions à prendre** — c'est là que se joue le résultat, pas dans la plomberie.
+Apple already converts your price across all 175 storefronts — but at the **exchange rate**.
+A $39.99/year subscription therefore stays around $36 in Nigeria or the Philippines, several
+times what a digital subscription actually sells for there. This skill replaces that
+conversion with a **purchasing-power multiplier**, country by country.
 
----
-
-## Décision 0 — Est-ce que ça vaut le coup pour vous ?
-
-**À trancher en premier, avec les chiffres sous les yeux.** Sortez votre répartition
-d'installs par pays sur 30 jours (App Store Connect → Sales and Trends, ou le rapport
-SALES de l'API, colonne `Country Code`).
-
-- Si un seul pays fait plus de 90 % de vos installs, le pricing PPP ne va **rien** vous
-  rapporter à court terme. Ce n'est pas une optimisation de revenu, c'est le **prérequis
-  d'une ouverture de marché** : le prix doit être en place avant de dépenser un euro
-  d'acquisition là-bas, sinon vous testerez un marché avec un prix hors de portée et vous
-  conclurez à tort qu'il ne convertit pas.
-- Si vous avez déjà du trafic international significatif, c'est une optimisation directe
-  et vous verrez l'effet en quelques semaines.
-
-Dans les deux cas ça vaut le coup de le faire — mais pas d'en attendre la même chose.
-Décidez maintenant ce que vous mesurerez, sinon vous jugerez au mauvais indicateur.
+The tool is `scripts/ppp_pricing.js` (no npm dependencies). What follows are the
+**decisions** — that's where the outcome is decided, not in the plumbing.
 
 ---
 
-## Décision 1 — Votre territoire de référence
+## Decision 0 — Is this worth it for them?
 
-Le pays dont le prix ne bougera jamais et sur lequel tous les autres sont indexés. En
-général votre marché principal. Tout le reste en découle, y compris les hausses.
+**Settle this first, with the numbers in view.** Pull their install split by country over
+30 days (App Store Connect → Sales and Trends, or the API's SALES report, `Country Code`
+column).
 
-Attention si votre marché principal est dans la zone euro : vos voisins partagent votre
-devise et votre langue publicitaire. Un utilisateur belge ou luxembourgeois peut comparer.
+- If one country is more than 90% of installs, PPP pricing will earn them **nothing** in
+  the short term. It isn't a revenue optimisation — it's the **precondition for opening a
+  market**. The price has to be right before they spend anything on acquisition there,
+  otherwise they'll test a market at an out-of-reach price and wrongly conclude it doesn't
+  convert.
+- If they already have meaningful international traffic, it's a direct optimisation and the
+  effect shows within weeks.
 
----
-
-## Décision 2 — Quels produits traiter
-
-**Le piège le plus courant.** Les prix sont attachés à un produit, pas à une app. Si vous
-faites des tests de prix, vous avez sans doute une dizaine de produits en base dont deux ou
-trois sont réellement servis par votre paywall.
-
-- **Ne traitez que les produits réellement vendus.** `node ppp_pricing.js produits` les
-  liste ; croisez avec ce que votre paywall sert vraiment (vos offerings RevenueCat /
-  Adapty / Superwall, ou votre code si vous appelez StoreKit en direct).
-- **Traitez-les tous, pas seulement le principal.** Si vous avez une offre de rétention,
-  une offre winback ou une offre soldée, et que vous ne baissez que l'offre principale,
-  vos offres secondaires deviennent *plus chères* que celle qu'on vient de refuser. C'est
-  le genre d'incohérence qu'on ne voit jamais depuis son propre pays.
-- **Notez-le quelque part** : chaque nouveau produit créé pour un test de prix repart avec
-  la conversion automatique d'Apple. Il faut relancer le script après chaque création,
-  sinon votre pricing régional disparaît du paywall sans le moindre signal.
+Worth doing either way — but not worth expecting the same thing from. Decide now what will
+be measured, or they'll judge it by the wrong number.
 
 ---
 
-## Décision 3 — Jusqu'où descendre (le plancher)
+## Decision 1 — The reference territory
 
-Le calcul brut de pouvoir d'achat donne des chiffres justes et **inexploitables** : à part
-de revenu constante, un abonnement à 49,99 € en France vaut 8,40 € au Maroc et 3,92 € au
-Sénégal. Personne ne vend à ce prix-là, pour trois raisons :
+The country whose price never moves, and against which every other is indexed. Usually their
+main market. Everything follows from it, including the increases.
 
-1. votre acheteur n'est pas l'habitant moyen — posséder un iPhone dans ces pays place déjà
-   dans le haut de la distribution ;
-2. sous un certain seuil vous ouvrez l'arbitrage par VPN et abîmez votre positionnement ;
-3. le marché réel est plus haut que le PPP : Spotify facture ~3,29 $/mois en Afrique de
-   l'Ouest, très au-dessus de ce que le pouvoir d'achat moyen justifierait.
-
-**Le plancher par défaut est 0,30** (30 % du prix de référence). C'est un choix, pas une
-loi. Descendre à 0,20 si votre coût marginal est nul et que vous visez le volume ; remonter
-à 0,40 si votre marque est premium.
-
-**Étalonnez sur un vrai comparable** avant de valider : allez voir le prix local de Spotify
-ou Netflix dans deux ou trois de vos pays cibles (`spotify.com/<code pays>/premium/`). Si
-votre prix cible est très au-dessus, vous êtes hors marché ; très en dessous, vous laissez
-de l'argent.
+Flag this if their main market is in the eurozone: neighbours share the currency and often
+the ad language. A Belgian or Irish user can compare directly.
 
 ---
 
-## Décision 4 — Monter là où le pouvoir d'achat est supérieur
+## Decision 2 — Which products
 
-Le calcul est symétrique : la Suisse, les États-Unis, le Luxembourg, l'Irlande ou Singapour
-ressortent au-dessus de la France. **Beaucoup de développeurs n'appliquent que les baisses,
-par prudence — et laissent l'argent sur la table.**
+**The most common trap.** Prices attach to products, not to the app. Anyone who runs price
+tests has a dozen products on file, of which two or three are actually served by the paywall.
 
-Décidez explicitement. Deux garde-fous :
-
-- **La concurrence locale prime sur le calcul.** Au-dessus de 1, ce n'est plus le pouvoir
-  d'achat qui contraint mais ce que font vos concurrents sur ce marché. Vérifiez avant
-  d'appliquer un +30 % sur un marché disputé.
-- **Le plafond par défaut est 1,30.** Au-delà, vous sortez des prix psychologiques usuels
-  et vous vous exposez à la comparaison entre marchés voisins.
-
-Et surtout : une hausse ne touchera **personne** parmi vos abonnés actuels (décision 5).
-
----
-
-## Décision 5 — Vos abonnés actuels
-
-C'est la question qui inquiète tout le monde, et elle a une réponse propre : l'attribut
-`preserveCurrentPrice` de l'API.
-
-- **`true`** (défaut du script) — les abonnés existants restent sur leur prix, hausses
-  comme baisses. Seuls les nouveaux achats prennent le nouveau prix.
-- **`false`** — une baisse profite à tout le monde au renouvellement suivant ; une hausse
-  exige le consentement explicite de chaque abonné, et son abonnement expire s'il ne
-  répond pas.
-
-**Ne créez pas de nouveaux produits pour ça.** C'est le réflexe courant et c'est une
-mauvaise idée : il en faudrait un par offre, à rebrancher dans votre outil de paywall, et
-vos séries analytiques par produit sont coupées en deux. Le booléen fait le travail.
-
-Le seul vrai arbitrage : sur les **baisses**, `true` laisse vos abonnés actuels payer plus
-cher que les nouveaux dans le même pays. Peu de monde, mais c'est un motif de litige et de
-demande de remboursement. `false` sur les baisses seules est défendable si vous avez déjà
-des abonnés dans les pays concernés.
+- **Only touch products that are actually sold.** `node ppp_pricing.js products` lists them;
+  cross-check against what the paywall really serves (RevenueCat / Adapty / Superwall
+  offerings, or their StoreKit code).
+- **Then do all of them, not just the main one.** If they have a retention offer, a winback
+  offer or a discounted tier, and only the main offer is lowered, the secondary offers end up
+  **more expensive** than the one the user just declined. That kind of inconsistency is
+  invisible from their own country.
+- **Write it down somewhere**: every new product created for a price test starts on Apple's
+  automatic conversion. The script must be re-run after each one, or regional pricing quietly
+  vanishes from the paywall with no signal at all.
 
 ---
 
-## Décision 6 — Le rythme d'entretien
+## Decision 3 — How low to go (the floor)
 
-Dès que vous fixez un prix à la main, **Apple cesse d'ajuster ce territoire tout seul**.
-Sur les monnaies volatiles, votre revenu net fond sans que rien ne vous alerte.
+The raw purchasing-power calculation gives numbers that are correct and **unusable**: at a
+constant share of income, a $39.99 subscription is worth about $5 in Nigeria. Nobody prices
+there, for three reasons:
 
-Décidez maintenant : soit vous relancez `init` puis `plan` une fois par trimestre (dix
-minutes), soit vous restreignez le périmètre aux pays dont la devise est stable ou qui sont
-facturés en dollars. Ne partez pas du principe que c'est un réglage définitif.
+1. their buyer is not the average resident — owning an iPhone already places someone high in
+   the local distribution;
+2. below a certain point they invite VPN arbitrage and damage their positioning;
+3. the real market sits above PPP: Spotify charges around $3.29/month across West Africa,
+   well above what average purchasing power would justify.
+
+**The default floor is 0.30** (30% of the reference price). That's a choice, not a law. Go to
+0.20 if marginal cost is nil and the goal is volume; raise it to 0.40 for a premium brand.
+
+**Calibrate against a real comparable** before committing: check the local price of Spotify
+or Netflix in two or three target countries (`spotify.com/<country code>/premium/`). Well
+above it and they're out of market; well below and they're leaving money behind.
 
 ---
 
-## Comment l'indice est calculé
+## Decision 4 — Raising prices where purchasing power is higher
+
+The maths is symmetrical: Switzerland, the US, Luxembourg, Ireland or Singapore come out
+above most reference markets. **Many developers apply only the decreases, out of caution, and
+leave money on the table.**
+
+Make it an explicit decision. Two guardrails:
+
+- **Local competition outranks the calculation.** Above 1.0 the binding constraint is no
+  longer purchasing power but what competitors charge in that market. Check before applying
+  +30% somewhere contested.
+- **The default cap is 1.30.** Beyond that they leave usual psychological price points and
+  invite comparison between neighbouring markets.
+
+And above all: an increase touches **none** of their current subscribers — see decision 5.
+
+---
+
+## Decision 5 — Their current subscribers
+
+The question everyone worries about, and it has a clean answer: the API's
+`preserveCurrentPrice` attribute.
+
+- **`true`** (the script's default) — existing subscribers stay on their current price, for
+  increases and decreases alike. Only new purchases get the new price.
+- **`false`** — a decrease reaches everyone at their next renewal; an increase requires each
+  subscriber's explicit consent, and their subscription lapses if they don't respond.
+
+**Don't create new products for this.** It's the common reflex and a costly one: one product
+per offer, all to be re-wired into their paywall tool, and their per-product analytics get
+cut in half. The boolean does the job.
+
+The one real trade-off: on **decreases**, `true` leaves existing subscribers paying more than
+new ones in the same country. Few people, but it's a refund-request and dispute magnet.
+`false` on decreases only is defensible if they already have subscribers in those countries.
+
+---
+
+## Decision 6 — The maintenance rhythm
+
+Once a price is set manually, **Apple stops adjusting that territory**. On volatile
+currencies, net revenue erodes with nothing to raise the alarm.
+
+Decide now: either re-run `init` then `plan` once a quarter (ten minutes), or restrict the
+scope to territories with stable currencies or billed in dollars. Don't let them assume it's
+a set-and-forget setting.
+
+---
+
+## How the index is computed
 
 ```
-indice = √( (RNB/hab PPP × part du revenu des 10 % les plus riches) / idem pays de référence )
+index = √( (GNI per capita PPP × income share of the top 10%) / same for the reference country )
 ```
 
-Données Banque mondiale, API publique et gratuite, aucune clé requise. Le RNB par habitant
-en PPP mesure le pouvoir d'achat réel ; la part du décile supérieur corrige le fait que
-votre acheteur n'est pas l'habitant moyen ; la racine amortit le reste, la consommation de
-cette population étant largement importée donc payée aux prix mondiaux. Puis on borne entre
-plancher et plafond.
+World Bank data, public API, no key required. GNI per capita at PPP measures real purchasing
+power; the top-decile share corrects for the fact that their buyer is not the average
+resident; the square root damps what remains, since that population consumes largely imported
+goods at world prices. The result is then clamped between floor and cap.
 
-Le prix cible n'est jamais converti à la main : on part de ce qu'Apple mettrait tout seul
-dans ce territoire (son « equalization » du prix de référence, taxes et arrondi local
-compris) et on lui applique l'indice. Aucun taux de change n'est manipulé.
+The target price is never converted by hand: the tool starts from what Apple would set on its
+own in that territory (its `equalization` of the reference price, local taxes and rounding
+included) and applies the index to it. No exchange rate is ever handled.
 
 ---
 
-## Procédure
+## Procedure
 
 ```bash
-node ppp_pricing.js produits                              # 1. lister les abonnements
-node ppp_pricing.js init --produits=<id>,<id> --ref=FRA   # 2. construire la config
-node ppp_pricing.js plan                                  # 3. simuler, LIRE le tableau
-node ppp_pricing.js apply --territoire=<un pays test>     # 4. un territoire témoin
-node ppp_pricing.js apply                                 # 5. dérouler
+node ppp_pricing.js products                              # 1. list subscriptions
+node ppp_pricing.js init --products=<id>,<id> --ref=USA   # 2. build the config
+node ppp_pricing.js plan                                  # 3. simulate — READ the table
+node ppp_pricing.js apply --territory=<one test country>  # 4. one canary territory
+node ppp_pricing.js apply                                 # 5. roll out
 ```
 
-Relisez le tableau de l'étape 3 ligne à ligne avant d'appliquer — c'est le seul moment où
-une erreur d'indice se voit. Puis écrivez **un seul territoire** à faible enjeu, relisez le
-prix depuis l'API, et seulement ensuite déroulez.
+Read the step-3 table line by line before applying — it's the only moment an index mistake is
+visible. Then write **one** low-stakes territory, read the price back from the API, and only
+then roll out.
 
-Prérequis : une clé App Store Connect API de rôle **App Manager** ou **Admin** (Users and
-Access → Integrations). Une clé de reporting ne suffit pas : elle lit les prix mais un
-403 tombera à l'écriture.
-
----
-
-## Après
-
-Les prix prennent effet le lendemain, pas immédiatement.
-
-Ne jugez pas au taux de conversion trial : dans un pays où vous n'aviez aucun volume, il
-sera bruité pendant des semaines. Regardez le **revenu par install** par pays, et comparez
-au coût d'acquisition local. Un prix deux fois plus bas sur un marché où le CPI est cinq
-fois moins cher reste beaucoup plus rentable — c'est tout l'intérêt de l'opération.
+Prerequisite: an App Store Connect API key with the **App Manager** or **Admin** role (Users
+and Access → Integrations). A reporting key is not enough — it reads prices fine, then takes
+a 403 on write.
 
 ---
 
-## Notes techniques
+## Afterwards
 
-Trois choses non documentées côté Apple, déjà gérées par le script mais utiles si vous
-écrivez votre propre version :
+Prices take effect the next day, not immediately.
 
-- `SubscriptionPriceCreateRequest` a trois attributs et les trois comptent : `planType`
-  (sinon un produit à plusieurs plans reçoit son prix sur le mauvais plan),
-  `preserveCurrentPrice`, et `startDate` — **obligatoire et au minimum J+1** (à `null`,
-  Apple comprend « prix initial » et refuse tout produit déjà approuvé).
-- L'index de prix Apple (le champ `p` de l'ID base64 d'un price point) est **global** : un
-  ID se forge pour n'importe quel produit, donc une grille de territoire chargée une fois
-  sert pour tous vos produits.
-- Un produit qui propose l'annuel **et** l'annuel payable au mois impose une cohérence
-  entre les deux plans : Apple refuse tout écrit qui laisserait le produit dans un état
-  intermédiaire (`INVALID_PRICE_TOO_HIGH` / `TOO_LOW`), quel que soit l'ordre. Il faut les
-  écrire ensemble via `PATCH /v1/subscriptions/{id}` — vérifiez d'abord sur un produit non
-  vendu que ce PATCH ajoute les prix au lieu de remplacer l'intégralité de la grille.
+Don't judge by trial conversion rate: in a country with no prior volume it stays noisy for
+weeks. Look at **revenue per install** per country, against local acquisition cost. A price
+cut in half in a market where CPI is five times lower is still far more profitable — that's
+the whole point of the exercise.
+
+---
+
+## API notes
+
+Three things Apple doesn't document, already handled by the script, worth knowing for anyone
+writing their own:
+
+- `SubscriptionPriceCreateRequest` has three attributes and all three matter: `planType`
+  (without it, a product with several payment plans gets its price on the wrong one),
+  `preserveCurrentPrice`, and `startDate` — **required, and at least one day in the future**
+  (at `null`, Apple reads it as "initial price" and rejects any already-approved product).
+- Apple's price index is **global**: the `p` field in a price point's base64 ID doesn't
+  depend on the subscription, so an ID can be forged for any product. One territory grid,
+  loaded once, serves every product.
+- A product offering both an annual plan **and** an annual-billed-monthly plan enforces
+  consistency between the two: Apple rejects any write that would leave it in an intermediate
+  state (`INVALID_PRICE_TOO_HIGH` / `TOO_LOW`), in either order. They must be written together
+  via `PATCH /v1/subscriptions/{id}` — and check first, on a product that isn't sold, that
+  this PATCH adds prices rather than replacing the whole grid.

@@ -1,98 +1,105 @@
-# Prix App Store par pouvoir d'achat
+# App Store pricing by purchasing power
 
-Skill [Claude Code](https://claude.com/claude-code) + outil en ligne de commande pour
-adapter les prix d'abonnement iOS au pouvoir d'achat réel de chaque pays.
+A [Claude Code](https://claude.com/claude-code) skill and standalone CLI that adapts iOS
+subscription prices to the real purchasing power of each country.
 
-## Le problème
+## The problem
 
-Apple convertit déjà votre prix dans les 175 territoires, mais **au taux de change**. Un
-abonnement à 49,99 €/an ressort donc autour de 45 $ au Maroc, au Sénégal ou en Côte
-d'Ivoire — plusieurs fois ce qu'un abonnement numérique se vend réellement là-bas. Spotify
-Premium y est à 3,29 $/mois quand la France paie 12,14 €.
+Apple already converts your price across all 175 storefronts — but at the **exchange rate**.
+A $39.99/year subscription therefore lands around $36 in Nigeria, India or the Philippines:
+several times what a digital subscription actually sells for in those markets. Spotify
+Premium is $3.29/month across West Africa while the US pays $11.99.
 
-Vous ne le voyez jamais depuis votre pays. Vos campagnes dans ces marchés convertissent
-mal, et vous concluez que le marché ne vaut rien — alors que c'est le prix qui est hors
-de portée.
+You never see it from your own country. Your campaigns in those markets convert badly, and
+you conclude the market is worthless — when it's the price that's out of reach.
 
-Le calcul inverse est vrai aussi : la Suisse, les États-Unis ou Singapour supportent un
-prix plus élevé que le vôtre, et l'auto-conversion d'Apple laisse cet argent sur la table.
+The reverse is true too: Switzerland, Singapore or the US can support a higher price than
+many reference markets, and Apple's automatic conversion leaves that money on the table.
 
-## Comment ça marche
+## How it works
 
-Quatre étapes, aucune saisie manuelle de taux de change.
+Four steps, no exchange rate ever entered by hand.
 
-**1. Un indice de pouvoir d'achat par pays.** Construit depuis l'API publique de la Banque
-mondiale (gratuite, sans clé) :
+**1. A purchasing-power index per country**, built from the World Bank's public API (free,
+no key):
 
 ```
-indice = √( (RNB/hab PPP × part du revenu des 10 % les plus riches) / idem pays de référence )
+index = √( (GNI per capita PPP × income share of the top 10%) / same for the reference country )
 ```
 
-- Le **RNB par habitant en PPP** mesure le pouvoir d'achat réel, pas le taux de change.
-- La **part du décile supérieur** corrige le biais central : votre acheteur n'est pas
-  l'habitant moyen. Posséder un iPhone place déjà dans le haut de la distribution.
-- La **racine carrée** amortit ce qu'il reste. Cette population consomme largement importé,
-  donc à des prix mondiaux.
+- **GNI per capita at PPP** measures real purchasing power rather than exchange rates.
+- **The top-decile share** corrects the central bias: your buyer is not the average
+  resident. Owning an iPhone already places someone high in the local distribution.
+- **The square root** damps what remains. That population consumes largely imported goods,
+  priced at world rates.
 
-Sans ces deux corrections, le calcul brut donne 8,40 € pour le Maroc et 3,92 € pour le
-Sénégal : des chiffres exacts et commercialement inexploitables.
+Without those two corrections the raw figure is exact and commercially unusable — a constant
+share of income puts a $39.99 subscription at roughly $5 in Nigeria.
 
-**2. Une base de conversion signée Apple.** Plutôt que de manipuler 43 devises et leurs
-taux, l'outil demande à Apple l'`equalization` de votre prix de référence : le prix
-équivalent qu'Apple mettrait lui-même dans chaque territoire, taxes locales et arrondi
-psychologique compris. L'indice s'applique sur cette base.
+**2. A conversion base signed by Apple.** Rather than juggling 40-odd currencies and their
+rates, the tool asks Apple for the `equalization` of your reference price: the equivalent
+price Apple itself would set in each territory, local taxes and psychological rounding
+included. The index is applied on top of that.
 
-**3. Un vrai point de prix.** Apple n'accepte que ~800 valeurs par territoire. L'outil
-choisit la plus proche de la cible, avec une préférence pour celles qui ressemblent à un
-prix : `19,99` l'emporte sur `20,14` à distance comparable, et `26 900 ₦` sur `27 013 ₦`.
+**3. A real price point.** Apple only accepts about 800 values per territory. The tool picks
+the closest to target, preferring the ones that read like a price: `29.99` wins over `30.14`
+at comparable distance, and `₦20,900` over `₦21,013`.
 
-**4. L'écriture, après simulation.** `plan` n'écrit jamais rien et sort le tableau complet
-avant/après. `apply` pousse les prix, avec reprise sur les erreurs transitoires de l'API.
+**4. Writing, after simulation.** `plan` never writes anything and prints the full
+before/after table. `apply` pushes the prices, retrying transient API errors.
 
-Exemple réel, prix de référence 49,99 € :
+Worked example, reference United States at $39.99/year — indices are real World Bank figures,
+"Apple default" is Apple's own conversion:
 
-| Territoire | Avant (auto Apple) | Après | Indice |
+| Territory | Apple default | PPP-adjusted | Index |
 |---|---|---|---|
-| États-Unis | 44,99 $ | 57,99 $ | 1,30 |
-| Suisse | 45 CHF | 51,90 CHF | 1,29 |
-| Maroc | 44,99 $ | 20,99 $ | 0,47 |
-| Côte d'Ivoire | 49,99 $ | 17,99 $ | 0,36 |
-| Sénégal | 49,99 $ | 14,99 $ | 0,30 |
-| Inde | 4 999 ₹ | 1 999 ₹ | 0,40 |
-| Nigeria | 69 900 ₦ | 26 900 ₦ | 0,39 |
+| United States (reference) | 39.99 USD | — | 1.00 |
+| Germany | 44.99 EUR | **38.99 EUR** | 0.86 |
+| United Kingdom | 39.99 GBP | **29.99 GBP** | 0.76 |
+| Türkiye | 1999.99 TRY | **1499.99 TRY** | 0.75 |
+| Japan | 6000 JPY | **4290 JPY** | 0.72 |
+| Poland | 199.99 PLN | **131.99 PLN** | 0.66 |
+| Brazil | 249.90 BRL | **142.90 BRL** | 0.57 |
+| Mexico | 899 MXN | **490 MXN** | 0.55 |
+| South Africa | 799.99 ZAR | **389.99 ZAR** | 0.49 |
+| Indonesia | 699000 IDR | **295000 IDR** | 0.42 |
+| Vietnam | 1199000 VND | **500000 VND** | 0.42 |
+| Philippines | 2490 PHP | **1020 PHP** | 0.41 |
+| India | 3999 INR | **1239 INR** | 0.31 |
+| Nigeria | 69900 NGN | **20900 NGN** | 0.30 (floor) |
 
-## Installation
+## Install
 
-### Comme skill Claude Code
+### As a Claude Code skill
 
 ```bash
 git clone https://github.com/harryjmg/appstore-ppp-pricing.git \
   ~/.claude/skills/appstore-ppp-pricing
 ```
 
-Puis, dans Claude Code : `/appstore-ppp-pricing`, ou simplement « adapte mes prix App Store
-au pouvoir d'achat de chaque pays ». Claude vous fait trancher les décisions qui comptent
-avant de lancer quoi que ce soit.
+Then, in Claude Code: `/appstore-ppp-pricing`, or just "adjust my App Store prices to each
+country's purchasing power". Claude walks you through the decisions that matter before
+anything is written — in your own language.
 
-### En ligne de commande
+### As a CLI
 
 ```bash
 cd scripts
-node ppp_pricing.js produits                              # lister vos abonnements
-node ppp_pricing.js init --produits=<id>,<id> --ref=FRA   # construire la config
-node ppp_pricing.js plan                                  # simuler — n'écrit rien
-node ppp_pricing.js apply                                 # écrire
+node ppp_pricing.js products                              # list your subscriptions
+node ppp_pricing.js init --products=<id>,<id> --ref=USA   # build the config
+node ppp_pricing.js plan                                  # dry run — writes nothing
+node ppp_pricing.js apply                                 # write
 ```
 
-## Prérequis
+## Requirements
 
-- **Node.js.** Aucune dépendance npm : le JWT ES256 est signé avec le module `crypto`
-  natif.
-- **Une clé App Store Connect API de rôle App Manager ou Admin**
-  (App Store Connect → Users and Access → Integrations). Une clé de reporting lit les prix
-  mais reçoit un 403 à l'écriture.
+- **Node.js.** No npm dependencies: the ES256 JWT is signed with the built-in `crypto`
+  module.
+- **An App Store Connect API key with the App Manager or Admin role**
+  (App Store Connect → Users and Access → Integrations). A reporting key reads prices fine,
+  then takes a 403 on write.
 
-Créez `scripts/asc_api_config.json`, avec le `.p8` dans le même dossier :
+Create `scripts/asc_api_config.json`, with the `.p8` in the same folder:
 
 ```json
 {
@@ -103,44 +110,51 @@ Créez `scripts/asc_api_config.json`, avec le `.p8` dans le même dossier :
 }
 ```
 
-Le `.gitignore` bloque la clé et la config. Vérifiez-le avant de pousser.
+The bundled `.gitignore` keeps the key and config out of git. Check it before you push.
 
-## Les décisions qui déterminent le résultat
+## The decisions that determine the outcome
 
-Le code est la partie facile. [`SKILL.md`](SKILL.md) détaille les six arbitrages :
+The code is the easy part. [`SKILL.md`](SKILL.md) covers the six trade-offs:
 
-1. **Est-ce que ça vaut le coup pour vous.** Si un pays fait 90 % de vos installs, c'est le
-   prérequis d'une ouverture de marché, pas un gain immédiat. Le savoir évite de juger au
-   mauvais indicateur.
-2. **Quels produits traiter.** Les prix sont attachés aux produits, pas à l'app. Ne baisser
-   que l'offre principale rend vos offres de rétention plus chères que celle qu'on vient
-   de refuser.
-3. **Jusqu'où descendre.** Où poser le plancher, et comment l'étalonner sur un comparable
-   réel plutôt que sur la théorie.
-4. **Faut-il monter** là où le pouvoir d'achat dépasse le vôtre. La plupart n'osent pas.
-5. **Vos abonnés actuels.** Un booléen de l'API les protège intégralement — inutile de
-   créer de nouveaux produits, ce qui est le réflexe courant et coûteux.
-6. **L'entretien.** Dès qu'un prix est fixé à la main, Apple cesse d'ajuster ce territoire.
+1. **Whether it's worth it for you.** If one country is 90% of your installs, this is the
+   precondition for opening a market, not an immediate gain. Knowing that keeps you from
+   judging it by the wrong metric.
+2. **Which products to touch.** Prices attach to products, not to your app. Lowering only
+   the main offer makes your retention offer more expensive than the one the user just
+   declined.
+3. **How low to go.** Where to set the floor, and how to calibrate it against a real
+   comparable rather than theory.
+4. **Whether to raise prices** where purchasing power exceeds your reference market. Most
+   people don't dare.
+5. **Your existing subscribers.** One API boolean protects them completely — no need to
+   create new products, which is the common and costly reflex.
+6. **Maintenance.** Once a price is set manually, Apple stops adjusting that territory.
 
-## Trois pièges de l'API App Store Connect
+## Three App Store Connect API gotchas
 
-Non documentés, déjà gérés — utiles si vous écrivez votre propre version.
+Undocumented, already handled — useful if you write your own version.
 
-- **`SubscriptionPriceCreateRequest` a trois attributs et les trois comptent.** `planType`
-  (sinon un produit à plusieurs plans reçoit son prix sur le mauvais), `preserveCurrentPrice`,
-  et `startDate` — obligatoire, et **au minimum J+1** : à `null` Apple comprend « prix
-  initial » et refuse tout produit déjà approuvé (`STATE_ERROR`), au jour même il refuse
-  aussi (`ENTITY_ERROR`).
-- **L'index de prix Apple est global.** Le champ `p` de l'ID base64 d'un price point ne
-  dépend pas de l'abonnement : l'ID se forge pour n'importe quel produit. Une grille de
-  territoire chargée une fois sert donc pour tous vos produits, au lieu de 800 points ×
-  175 territoires × N produits.
-- **Un produit à deux plans de paiement impose une cohérence entre eux.** Annuel payé
-  d'avance + annuel payable au mois : Apple refuse tout écrit qui laisserait le produit
-  dans un état intermédiaire (`INVALID_PRICE_TOO_HIGH` / `TOO_LOW`), quel que soit l'ordre.
-  Il faut les écrire ensemble via `PATCH /v1/subscriptions/{id}` — et vérifier d'abord sur
-  un produit non vendu que ce PATCH ajoute les prix au lieu de remplacer toute la grille.
+- **`SubscriptionPriceCreateRequest` has three attributes and all three matter.** `planType`
+  (without it, a product with several payment plans gets its price on the wrong one),
+  `preserveCurrentPrice`, and `startDate` — required, and **at least one day in the future**:
+  at `null` Apple reads it as "initial price" and rejects any approved product
+  (`STATE_ERROR`); same day is rejected too (`ENTITY_ERROR`).
+- **Apple's price index is global.** The `p` field in a price point's base64 ID doesn't
+  depend on the subscription, so the ID can be forged for any product. One territory grid,
+  loaded once, serves all your products — instead of 800 points × 175 territories × N
+  products.
+- **A product with two payment plans enforces consistency between them.** Annual upfront plus
+  annual-billed-monthly: Apple rejects any write leaving the product in an intermediate state
+  (`INVALID_PRICE_TOO_HIGH` / `TOO_LOW`), in either order. They have to be written together
+  via `PATCH /v1/subscriptions/{id}` — and verify first, on a product you don't sell, that
+  this PATCH adds prices rather than replacing the entire grid.
 
-## Licence
+## Data sources
 
-MIT. Aucune garantie : `plan` avant `apply`, et relisez le tableau.
+World Bank ([GNI per capita PPP](https://data.worldbank.org/indicator/NY.GNP.PCAP.PP.CD),
+[income share of the top 10%](https://data.worldbank.org/indicator/SI.DST.10TH.10)), public
+API, no key. Apple's own price equalizations for currency conversion.
+
+## License
+
+MIT. No warranty: run `plan` before `apply`, and read the table.

@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * Prix App Store indexés sur le pouvoir d'achat local.
+ * App Store subscription prices indexed on local purchasing power.
  *
- *   node ppp_pricing.js produits          liste les abonnements du compte
- *   node ppp_pricing.js init              construit ppp_config.json (indices Banque mondiale)
- *   node ppp_pricing.js plan              simulation : ce qui changerait, sans rien écrire
- *   node ppp_pricing.js apply             écrit les prix
+ *   node ppp_pricing.js products          list the account's subscriptions
+ *   node ppp_pricing.js init              build ppp_config.json (World Bank indices)
+ *   node ppp_pricing.js plan              dry run: what would change, writing nothing
+ *   node ppp_pricing.js apply             write the prices
  *
- * Zéro dépendance npm : le JWT ES256 est signé avec le module crypto de Node.
+ * No npm dependencies: the ES256 JWT is signed with Node's built-in crypto module.
  *
- * Prérequis : une clé App Store Connect API de rôle App Manager ou Admin, et un fichier
- * asc_api_config.json à côté de ce script :
+ * Requires an App Store Connect API key with the App Manager or Admin role, and an
+ * asc_api_config.json sitting next to this script:
  *
  *   { "key_id": "XXXXXXXXXX",
  *     "issuer_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -23,59 +23,57 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const ICI = __dirname;
-const ASC_CONFIG = path.join(ICI, 'asc_api_config.json');
-const PPP_CONFIG = path.join(ICI, 'ppp_config.json');
-const CACHE = path.join(ICI, '.ppp_grid_cache.json');
+const HERE = __dirname;
+const ASC_CONFIG = path.join(HERE, 'asc_api_config.json');
+const PPP_CONFIG = path.join(HERE, 'ppp_config.json');
+const CACHE = path.join(HERE, '.ppp_grid_cache.json');
 const HOST = 'api.appstoreconnect.apple.com';
 
 const args = process.argv.slice(3);
-const commande = process.argv[2];
-const flag = n => args.includes('--' + n);
+const command = process.argv[2];
 const opt = (n, def = null) => { const a = args.find(x => x.startsWith(`--${n}=`)); return a ? a.split('=').slice(1).join('=') : def; };
 
-// ───────────────────────────────────────────────── JWT ES256 sans dépendance
+// ────────────────────────────────────────────── ES256 JWT, no dependencies
 
 const b64url = b => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
-/** La signature ECDSA de Node sort en DER ; JOSE veut r||s sur 32 octets chacun. */
-function derVersJose(der) {
+/** Node's ECDSA signature comes out DER-encoded; JOSE wants r||s, 32 bytes each. */
+function derToJose(der) {
     let i = 2;
     if (der[1] & 0x80) i = 2 + (der[1] & 0x7f);
-    const lireEntier = () => {
-        if (der[i++] !== 0x02) throw new Error('signature DER inattendue');
+    const readInt = () => {
+        if (der[i++] !== 0x02) throw new Error('unexpected DER signature');
         const len = der[i++];
         let v = der.subarray(i, i + len); i += len;
         while (v.length > 32 && v[0] === 0) v = v.subarray(1);
         return Buffer.concat([Buffer.alloc(32 - v.length, 0), v]);
     };
-    return Buffer.concat([lireEntier(), lireEntier()]);
+    return Buffer.concat([readInt(), readInt()]);
 }
 
-function jeton() {
+function token() {
     if (!fs.existsSync(ASC_CONFIG)) {
-        console.error(`❌ ${path.basename(ASC_CONFIG)} manquant. Voir l'en-tête de ce script.`);
+        console.error(`❌ ${path.basename(ASC_CONFIG)} is missing. See the header of this script.`);
         process.exit(1);
     }
     const cfg = JSON.parse(fs.readFileSync(ASC_CONFIG, 'utf8'));
-    const cle = fs.readFileSync(path.join(ICI, cfg.key_file), 'utf8');
-    const maintenant = Math.floor(Date.now() / 1000);
-    const entete = b64url(JSON.stringify({ alg: 'ES256', kid: cfg.key_id, typ: 'JWT' }));
-    const corps = b64url(JSON.stringify({ iss: cfg.issuer_id, iat: maintenant, exp: maintenant + 1200, aud: 'appstoreconnect-v1' }));
-    const signeur = crypto.createSign('SHA256');
-    signeur.update(`${entete}.${corps}`);
-    const sig = b64url(derVersJose(signeur.sign(cle)));
-    return { jwt: `${entete}.${corps}.${sig}`, cfg };
+    const key = fs.readFileSync(path.join(HERE, cfg.key_file), 'utf8');
+    const now = Math.floor(Date.now() / 1000);
+    const header = b64url(JSON.stringify({ alg: 'ES256', kid: cfg.key_id, typ: 'JWT' }));
+    const payload = b64url(JSON.stringify({ iss: cfg.issuer_id, iat: now, exp: now + 1200, aud: 'appstoreconnect-v1' }));
+    const signer = crypto.createSign('SHA256');
+    signer.update(`${header}.${payload}`);
+    return { jwt: `${header}.${payload}.${b64url(derToJose(signer.sign(key)))}`, cfg };
 }
 
-// ───────────────────────────────────────────────────────────────── transport
+// ──────────────────────────────────────────────────────────────── transport
 
-function appelBrut(methode, chemin, jwt, corps = null) {
+function rawCall(method, apiPath, jwt, body = null) {
     return new Promise((res, rej) => {
-        const p = corps ? JSON.stringify(corps) : null;
+        const p = body ? JSON.stringify(body) : null;
         const h = { Authorization: 'Bearer ' + jwt };
         if (p) { h['Content-Type'] = 'application/json'; h['Content-Length'] = Buffer.byteLength(p); }
-        const r = https.request({ hostname: HOST, path: chemin, method: methode, headers: h }, x => {
+        const r = https.request({ hostname: HOST, path: apiPath, method, headers: h }, x => {
             let d = ''; x.on('data', c => d += c);
             x.on('end', () => { try { res({ s: x.statusCode, d: JSON.parse(d) }); } catch (e) { res({ s: x.statusCode, d }); } });
         });
@@ -84,31 +82,31 @@ function appelBrut(methode, chemin, jwt, corps = null) {
 }
 
 /**
- * L'API renvoie régulièrement des 500 passagers, et des 429 si on va trop vite.
- * Sans reprise, un run de plusieurs centaines d'écritures s'arrête sur un aléa réseau.
- * On ne réessaie que ce qui est transitoire : un 4xx métier doit remonter tel quel.
+ * The API returns occasional transient 500s, and 429s if pushed too fast. Without a retry,
+ * a run of several hundred writes dies on a network hiccup. Only transient statuses are
+ * retried — a business 4xx must surface as-is.
  */
-async function appel(methode, chemin, jwt, corps = null, essais = 3) {
-    let derniere = null;
-    for (let i = 0; i < essais; i++) {
+async function call(method, apiPath, jwt, body = null, attempts = 3) {
+    let last = null;
+    for (let i = 0; i < attempts; i++) {
         try {
-            const r = await appelBrut(methode, chemin, jwt, corps);
+            const r = await rawCall(method, apiPath, jwt, body);
             if (![429, 500, 502, 503, 504].includes(r.s)) return r;
-            derniere = r;
+            last = r;
         } catch (e) {
-            derniere = { s: 0, d: { erreur: e.message } };
+            last = { s: 0, d: { error: e.message } };
         }
-        if (i < essais - 1) await new Promise(s => setTimeout(s, 1500 * (i + 1)));
+        if (i < attempts - 1) await new Promise(s => setTimeout(s, 1500 * (i + 1)));
     }
-    return derniere;
+    return last;
 }
 
-async function tout(chemin, jwt, stop = null) {
-    let data = [], included = [], next = chemin, pages = 0;
+async function getAll(apiPath, jwt, stop = null) {
+    let data = [], included = [], next = apiPath, pages = 0;
     while (next && pages < 20) {
-        const r = await appel('GET', next, jwt);
+        const r = await call('GET', next, jwt);
         if (r.s !== 200) {
-            if (pages === 0) throw new Error(`GET ${chemin} → ${r.s} ${JSON.stringify(r.d).slice(0, 200)}`);
+            if (pages === 0) throw new Error(`GET ${apiPath} → ${r.s} ${JSON.stringify(r.d).slice(0, 200)}`);
             break;
         }
         pages++;
@@ -121,97 +119,102 @@ async function tout(chemin, jwt, stop = null) {
 }
 
 const decode = id => JSON.parse(Buffer.from(id, 'base64').toString());
-/** L'index de prix Apple est global : un ID de price point se forge pour tout produit. */
+/** Apple's price index is global: a price point ID can be forged for any product. */
 const forge = (sub, terr, p) => Buffer.from(JSON.stringify({ s: String(sub), t: terr, p: String(p) })).toString('base64').replace(/=+$/, '');
 
 const fetchJson = url => new Promise((res, rej) => {
-    https.get(url, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => { try { res(JSON.parse(d)); } catch (e) { rej(new Error('réponse illisible')); } }); }).on('error', rej);
+    https.get(url, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => { try { res(JSON.parse(d)); } catch (e) { rej(new Error('unreadable response')); } }); }).on('error', rej);
 });
 
-// ─────────────────────────────────────────────────────────────── commandes
+// ───────────────────────────────────────────────────────────────── commands
 
-async function cmdProduits() {
-    const { jwt, cfg } = jeton();
-    const groupes = await tout(`/v1/apps/${cfg.app_id}/subscriptionGroups?limit=50`, jwt);
-    for (const g of groupes.data) {
-        console.log(`\nGroupe ${g.id} — ${g.attributes.referenceName}`);
-        const subs = await tout(`/v1/subscriptionGroups/${g.id}/subscriptions?limit=200`, jwt);
+async function cmdProducts() {
+    const { jwt, cfg } = token();
+    const groups = await getAll(`/v1/apps/${cfg.app_id}/subscriptionGroups?limit=50`, jwt);
+    for (const g of groups.data) {
+        console.log(`\nGroup ${g.id} — ${g.attributes.referenceName}`);
+        const subs = await getAll(`/v1/subscriptionGroups/${g.id}/subscriptions?limit=200`, jwt);
         for (const s of subs.data) {
             console.log(`  ${s.id}  ${(s.attributes.productId || '').padEnd(28)} ${s.attributes.subscriptionPeriod || ''}  ${s.attributes.state}`);
         }
     }
-    console.log('\nNe retenez que les produits réellement vendus par votre paywall.');
-    console.log('Puis : node ppp_pricing.js init --produits=<id>,<id> --ref=FRA');
+    console.log('\nKeep only the products your paywall actually sells.');
+    console.log('Then: node ppp_pricing.js init --products=<id>,<id> --ref=USA');
 }
 
 async function cmdInit() {
-    const { jwt } = jeton();
-    const produits = (opt('produits') || '').split(',').filter(Boolean);
+    const { jwt } = token();
+    const products = (opt('products') || '').split(',').filter(Boolean);
     const ref = opt('ref', 'USA');
-    if (!produits.length) { console.error('❌ --produits=<ascId>,<ascId> requis (voir : node ppp_pricing.js produits)'); process.exit(1); }
+    if (!products.length) { console.error('❌ --products=<ascId>,<ascId> is required (see: node ppp_pricing.js products)'); process.exit(1); }
 
-    const terrDemandes = opt('territoires');
-    const territoires = terrDemandes && terrDemandes !== 'all'
-        ? terrDemandes.split(',')
-        : (await tout('/v1/territories?limit=200', jwt)).data.map(t => t.id);
+    const asked = opt('territories');
+    const territories = asked && asked !== 'all'
+        ? asked.split(',')
+        : (await getAll('/v1/territories?limit=200', jwt)).data.map(t => t.id);
 
-    const pays = [...new Set([ref, ...territoires])].filter(c => c !== ref || true);
-    console.log(`Banque mondiale — ${pays.length} territoires…`);
+    const countries = [...new Set([ref, ...territories])];
+    console.log(`World Bank — ${countries.length} territories…`);
 
-    const indicateur = async (code, mrv) => {
-        const r = await fetchJson(`https://api.worldbank.org/v2/country/${pays.join('%3B')}/indicator/${code}?format=json&mrv=${mrv}&per_page=2000`);
+    const indicator = async (code, mrv) => {
+        const r = await fetchJson(`https://api.worldbank.org/v2/country/${countries.join('%3B')}/indicator/${code}?format=json&mrv=${mrv}&per_page=2000`);
         const o = {};
         for (const x of (r[1] || [])) {
             if (x.value == null) continue;
             const c = x.countryiso3code;
-            if (!o[c] || x.date > o[c].annee) o[c] = { v: x.value, annee: x.date, nom: x.country.value };
+            if (!o[c] || x.date > o[c].year) o[c] = { v: x.value, year: x.date, name: x.country.value };
         }
         return o;
     };
-    const rnb = await indicateur('NY.GNP.PCAP.PP.CD', 3);      // RNB/hab PPP
-    const decile = await indicateur('SI.DST.10TH.10', 10);      // part des 10 % les plus riches
+    const gni = await indicator('NY.GNP.PCAP.PP.CD', 3);   // GNI per capita, PPP
+    const decile = await indicator('SI.DST.10TH.10', 10);  // income share of the top 10%
 
-    if (!rnb[ref]) { console.error(`❌ pas de donnée Banque mondiale pour la référence ${ref}`); process.exit(1); }
-    const defaut = r => (r > 40000 ? 26 : r > 15000 ? 31 : 33);
-    const partRef = decile[ref] ? decile[ref].v : defaut(rnb[ref].v);
-    const socle = rnb[ref].v * partRef;
+    if (!gni[ref]) { console.error(`❌ no World Bank data for reference territory ${ref}`); process.exit(1); }
+    const fallback = g => (g > 40000 ? 26 : g > 15000 ? 31 : 33);
+    const refShare = decile[ref] ? decile[ref].v : fallback(gni[ref].v);
+    const baseline = gni[ref].v * refShare;
 
-    const plancher = parseFloat(opt('plancher', '0.30'));
-    const plafond = parseFloat(opt('plafond', '1.30'));
+    const floor = parseFloat(opt('floor', '0.30'));
+    const cap = parseFloat(opt('cap', '1.30'));
 
-    const sortie = {};
-    let ignores = 0;
-    for (const t of territoires) {
+    const out = {};
+    let skipped = 0;
+    for (const t of territories) {
         if (t === ref) continue;
-        if (!rnb[t]) { ignores++; continue; }
-        const part = decile[t] ? decile[t].v : defaut(rnb[t].v);
-        const amorti = Math.sqrt((rnb[t].v * part) / socle);
-        sortie[t] = {
-            index: Number(Math.min(plafond, Math.max(plancher, amorti)).toFixed(3)),
-            rnb_ppp: rnb[t].v, part_decile_sup: part,
-            source_decile: decile[t] ? String(decile[t].annee) : 'défaut',
-            borne: amorti < plancher ? 'plancher' : amorti > plafond ? 'plafond' : null,
+        if (!gni[t]) { skipped++; continue; }
+        const share = decile[t] ? decile[t].v : fallback(gni[t].v);
+        const damped = Math.sqrt((gni[t].v * share) / baseline);
+        out[t] = {
+            index: Number(Math.min(cap, Math.max(floor, damped)).toFixed(3)),
+            gni_ppp: gni[t].v, top_decile_share: share,
+            decile_source: decile[t] ? String(decile[t].year) : 'fallback',
+            bound: damped < floor ? 'floor' : damped > cap ? 'cap' : null,
         };
     }
 
     const cfg = {
-        reference: { territoire: ref },
-        bornes: { plancher, plafond, seuil_modification_pct: 5, fenetre_price_point_pct: 8 },
+        reference: { territory: ref },
+        bounds: { floor, cap, change_threshold_pct: 5, price_point_window_pct: 8 },
         preserve_current_price: true,
-        date_effet: null,
+        effective_date: null,
         plan_types: ['UPFRONT', 'MONTHLY'],
-        subscriptions: produits.map(id => ({ asc_id: id })),
-        territoires: sortie,
+        subscriptions: products.map(id => ({ asc_id: id })),
+        territories: out,
     };
     fs.writeFileSync(PPP_CONFIG, JSON.stringify(cfg, null, 2));
-    console.log(`✅ ppp_config.json — ${Object.keys(sortie).length} territoires indexés, ${ignores} sans donnée (non touchés).`);
-    console.log('   Relisez les indices, puis : node ppp_pricing.js plan');
+    console.log(`✅ ppp_config.json — ${Object.keys(out).length} territories indexed, ${skipped} without data (left untouched).`);
+    console.log('   Review the indices, then: node ppp_pricing.js plan');
 }
 
-function malusEsthetique(prix) {
-    const s = prix.toFixed(2);
-    if (Number.isInteger(prix) && prix >= 100) {
-        const e = String(prix);
+/**
+ * A price on a paywall has to look like a price: between two price points equally close to
+ * the target, prefer the one that reads well. The penalty is expressed in relative-gap
+ * points, so an ugly price only wins when it is markedly closer.
+ */
+function uglinessPenalty(price) {
+    const s = price.toFixed(2);
+    if (Number.isInteger(price) && price >= 100) {
+        const e = String(price);
         if (e.endsWith('999') || e.endsWith('900')) return 0;
         if (e.endsWith('99') || e.endsWith('90') || e.endsWith('000')) return 0.005;
         if (e.endsWith('9') || e.endsWith('0')) return 0.015;
@@ -224,135 +227,137 @@ function malusEsthetique(prix) {
     return 0.05;
 }
 
-async function construirePlan(jwt, cfg) {
+async function buildPlan(jwt, cfg) {
     const cache = fs.existsSync(CACHE) ? JSON.parse(fs.readFileSync(CACHE, 'utf8')) : {};
-    const ref = cfg.reference.territoire;
-    const lignes = [];
+    const ref = cfg.reference.territory;
+    const only = opt('territory') ? opt('territory').split(',') : null;
+    const rows = [];
 
     for (const sub of cfg.subscriptions) {
-        if (sub.exclu) { console.log(`⏭️  ${sub.asc_id} ignoré — ${sub.exclu}`); continue; }
+        if (sub.skip) { console.log(`⏭️  ${sub.asc_id} skipped — ${sub.skip}`); continue; }
 
-        const { data, included } = await tout(
+        const { data, included } = await getAll(
             `/v1/subscriptions/${sub.asc_id}/prices?limit=200&include=subscriptionPricePoint,territory`, jwt);
-        const pts = {};
-        for (const i of included) if (i.type === 'subscriptionPricePoints') pts[i.id] = i.attributes;
-        const actuels = {};
+        const points = {};
+        for (const i of included) if (i.type === 'subscriptionPricePoints') points[i.id] = i.attributes;
+        const current = {};
         for (const p of data) {
             const t = p.relationships.territory.data.id;
-            const pp = pts[p.relationships.subscriptionPricePoint.data.id] || {};
-            (actuels[t] = actuels[t] || {})[p.attributes.planType] = {
-                prix: parseFloat(pp.customerPrice),
+            const pp = points[p.relationships.subscriptionPricePoint.data.id] || {};
+            (current[t] = current[t] || {})[p.attributes.planType] = {
+                price: parseFloat(pp.customerPrice),
                 pricePointId: p.relationships.subscriptionPricePoint.data.id,
             };
         }
-        if (!actuels[ref]) throw new Error(`${sub.asc_id} : aucun prix sur le territoire de référence ${ref}`);
+        if (!current[ref]) throw new Error(`${sub.asc_id}: no price on reference territory ${ref}`);
 
         for (const planType of cfg.plan_types) {
-            const prixRef = actuels[ref][planType];
-            if (!prixRef) continue;
+            const refPrice = current[ref][planType];
+            if (!refPrice) continue;
 
-            // Base Apple : l'équivalent du prix de référence dans chaque territoire,
-            // change + taxes + arrondi local déjà intégrés. Aucun taux à manipuler.
-            const eq = await tout(`/v1/subscriptionPricePoints/${prixRef.pricePointId}/equalizations?limit=200`, jwt);
+            // Apple's own equalization of the reference price: what it would charge in each
+            // territory, taxes and local rounding included. No exchange rate to handle.
+            const eq = await getAll(`/v1/subscriptionPricePoints/${refPrice.pricePointId}/equalizations?limit=200`, jwt);
             const base = {};
             for (const e of eq.data) base[decode(e.id).t] = parseFloat(e.attributes.customerPrice);
 
-            for (const [terr, conf] of Object.entries(cfg.territoires)) {
+            for (const [terr, conf] of Object.entries(cfg.territories)) {
                 if (base[terr] == null) continue;
-                const cible = base[terr] * conf.index;
+                if (only && !only.includes(terr)) continue;
+                const target = base[terr] * conf.index;
 
-                let grille = cache[terr] && cache[terr].max >= cible * 1.2 ? cache[terr].points : null;
-                if (!grille) {
-                    const g = await tout(
+                let grid = cache[terr] && cache[terr].max >= target * 1.2 ? cache[terr].points : null;
+                if (!grid) {
+                    const g = await getAll(
                         `/v1/subscriptions/${sub.asc_id}/pricePoints?filter[territory]=${terr}&limit=200`, jwt,
-                        acc => acc.length && parseFloat(acc[acc.length - 1].attributes.customerPrice) > cible * 1.2);
-                    grille = g.data.map(p => ({ p: decode(p.id).p, px: parseFloat(p.attributes.customerPrice) }));
-                    cache[terr] = { points: grille, max: grille.length ? grille[grille.length - 1].px : 0 };
+                        acc => acc.length && parseFloat(acc[acc.length - 1].attributes.customerPrice) > target * 1.2);
+                    grid = g.data.map(p => ({ p: decode(p.id).p, px: parseFloat(p.attributes.customerPrice) }));
+                    cache[terr] = { points: grid, max: grid.length ? grid[grid.length - 1].px : 0 };
                 }
-                if (!grille.length) continue;
+                if (!grid.length) continue;
 
-                let choisi = null, score = Infinity;
-                for (const p of grille) {
-                    const ecart = Math.abs(p.px - cible) / cible;
-                    const s = ecart + (ecart <= cfg.bornes.fenetre_price_point_pct / 100 ? malusEsthetique(p.px) : 0);
-                    if (s < score) { score = s; choisi = p; }
+                let pick = null, best = Infinity;
+                for (const p of grid) {
+                    const gap = Math.abs(p.px - target) / target;
+                    const score = gap + (gap <= cfg.bounds.price_point_window_pct / 100 ? uglinessPenalty(p.px) : 0);
+                    if (score < best) { best = score; pick = p; }
                 }
 
-                const actuel = (actuels[terr] || {})[planType];
-                const delta = actuel ? (choisi.px - actuel.prix) / actuel.prix * 100 : null;
-                lignes.push({
-                    subId: sub.asc_id, planType, territoire: terr, index: conf.index, borne: conf.borne,
-                    prixActuel: actuel ? actuel.prix : null, prixRetenu: choisi.px, cible, delta,
-                    pricePointId: forge(sub.asc_id, terr, choisi.p),
-                    aModifier: delta != null && Math.abs(delta) >= cfg.bornes.seuil_modification_pct,
+                const now = (current[terr] || {})[planType];
+                const delta = now ? (pick.px - now.price) / now.price * 100 : null;
+                rows.push({
+                    subId: sub.asc_id, planType, territory: terr, index: conf.index, bound: conf.bound,
+                    currentPrice: now ? now.price : null, newPrice: pick.px, target, delta,
+                    pricePointId: forge(sub.asc_id, terr, pick.p),
+                    change: delta != null && Math.abs(delta) >= cfg.bounds.change_threshold_pct,
                 });
             }
         }
     }
     fs.writeFileSync(CACHE, JSON.stringify(cache));
-    return lignes;
+    return rows;
 }
 
-async function cmdPlan(appliquer) {
-    if (!fs.existsSync(PPP_CONFIG)) { console.error('❌ ppp_config.json manquant. Lancez d\'abord : node ppp_pricing.js init'); process.exit(1); }
+async function cmdPlan(write) {
+    if (!fs.existsSync(PPP_CONFIG)) { console.error('❌ ppp_config.json is missing. Run: node ppp_pricing.js init'); process.exit(1); }
     const cfg = JSON.parse(fs.readFileSync(PPP_CONFIG, 'utf8'));
-    const { jwt } = jeton();
+    const { jwt } = token();
 
-    console.log(appliquer ? '🔴 ÉCRITURE' : '🔵 Simulation — rien ne sera écrit');
-    console.log(`   référence ${cfg.reference.territoire} · abonnés existants : ${cfg.preserve_current_price ? 'prix préservé' : '⚠️ NON préservé'}\n`);
+    console.log(write ? '🔴 WRITING' : '🔵 Dry run — nothing will be written');
+    console.log(`   reference ${cfg.reference.territory} · existing subscribers: ${cfg.preserve_current_price ? 'price preserved' : '⚠️ NOT preserved'}\n`);
 
-    const lignes = await construirePlan(jwt, cfg);
-    const aFaire = lignes.filter(l => l.aModifier).sort((a, b) => b.delta - a.delta);
+    const rows = await buildPlan(jwt, cfg);
+    const todo = rows.filter(r => r.change).sort((a, b) => b.delta - a.delta);
 
-    for (const l of aFaire) {
-        const d = (l.delta > 0 ? '+' : '') + Math.round(l.delta) + '%';
-        console.log(`   ${l.territoire.padEnd(5)} ${l.planType.toLowerCase().padEnd(8)} ${String(l.prixActuel).padStart(10)} → ${String(l.prixRetenu).padStart(10)} ${d.padStart(7)}   ×${l.index}${l.borne ? ' (' + l.borne + ')' : ''}`);
+    for (const r of todo) {
+        const d = (r.delta > 0 ? '+' : '') + Math.round(r.delta) + '%';
+        console.log(`   ${r.territory.padEnd(5)} ${r.planType.toLowerCase().padEnd(8)} ${String(r.currentPrice).padStart(10)} → ${String(r.newPrice).padStart(10)} ${d.padStart(7)}   ×${r.index}${r.bound ? ' (' + r.bound + ')' : ''}`);
     }
-    console.log(`\n${aFaire.length} prix à écrire · ${aFaire.filter(l => l.delta > 0).length} hausse(s) · ${aFaire.filter(l => l.delta < 0).length} baisse(s)`);
+    console.log(`\n${todo.length} price(s) to write · ${todo.filter(r => r.delta > 0).length} increase(s) · ${todo.filter(r => r.delta < 0).length} decrease(s)`);
 
-    if (!appliquer) { console.log('\nRien n\'a été modifié. Relancez avec « apply » quand le plan vous convient.'); return; }
+    if (!write) { console.log('\nNothing was changed. Re-run with "apply" once the plan looks right.'); return; }
 
-    // Trois attributs, et les trois comptent — voir SKILL.md.
-    const demain = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
-    const startDate = cfg.date_effet || demain;
-    let ok = 0, ko = 0;
-    for (const l of aFaire) {
-        const r = await appel('POST', '/v1/subscriptionPrices', jwt, {
+    // Three attributes, and all three matter — see SKILL.md.
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    const startDate = cfg.effective_date || tomorrow;
+    let ok = 0, failed = 0;
+    for (const r of todo) {
+        const res = await call('POST', '/v1/subscriptionPrices', jwt, {
             data: {
                 type: 'subscriptionPrices',
-                attributes: { planType: l.planType, startDate, preserveCurrentPrice: cfg.preserve_current_price },
+                attributes: { planType: r.planType, startDate, preserveCurrentPrice: cfg.preserve_current_price },
                 relationships: {
-                    subscription: { data: { type: 'subscriptions', id: l.subId } },
-                    subscriptionPricePoint: { data: { type: 'subscriptionPricePoints', id: l.pricePointId } },
+                    subscription: { data: { type: 'subscriptions', id: r.subId } },
+                    subscriptionPricePoint: { data: { type: 'subscriptionPricePoints', id: r.pricePointId } },
                 },
             },
         });
-        if (r.s === 200 || r.s === 201) { ok++; process.stdout.write('.'); }
+        if (res.s === 200 || res.s === 201) { ok++; process.stdout.write('.'); }
         else {
-            ko++;
-            console.log(`\n❌ ${l.subId} ${l.territoire} ${l.planType} → ${r.s} ${JSON.stringify(r.d).slice(0, 240)}`);
-            if (r.s === 403) { console.error('\nLa clé n\'a pas le droit d\'écrire les prix : rôle App Manager ou Admin requis.'); break; }
+            failed++;
+            console.log(`\n❌ ${r.subId} ${r.territory} ${r.planType} → ${res.s} ${JSON.stringify(res.d).slice(0, 240)}`);
+            if (res.s === 403) { console.error('\nThis key cannot write prices: App Manager or Admin role required.'); break; }
         }
         await new Promise(s => setTimeout(s, 250));
     }
-    console.log(`\n\n✅ ${ok} écrit(s)${ko ? ` · ❌ ${ko} échec(s)` : ''} — effet au ${startDate}`);
+    console.log(`\n\n✅ ${ok} written${failed ? ` · ❌ ${failed} failed` : ''} — effective ${startDate}`);
 }
 
-const commandes = {
-    produits: cmdProduits,
+const commands = {
+    products: cmdProducts,
     init: cmdInit,
     plan: () => cmdPlan(false),
     apply: () => cmdPlan(true),
 };
 
-if (!commandes[commande]) {
-    console.log('Usage : node ppp_pricing.js <produits|init|plan|apply> [options]');
-    console.log('  produits                        liste les abonnements du compte');
-    console.log('  init --produits=id,id --ref=FRA construit ppp_config.json');
-    console.log('       [--territoires=all|A,B]    par défaut : tous les territoires App Store');
-    console.log('       [--plancher=0.30 --plafond=1.30]');
-    console.log('  plan                            simulation');
-    console.log('  apply                           écriture');
-    process.exit(commande ? 1 : 0);
+if (!commands[command]) {
+    console.log('Usage: node ppp_pricing.js <products|init|plan|apply> [options]');
+    console.log('  products                        list the account\'s subscriptions');
+    console.log('  init --products=id,id --ref=USA build ppp_config.json');
+    console.log('       [--territories=all|A,B]    default: every App Store territory');
+    console.log('       [--floor=0.30 --cap=1.30]');
+    console.log('  plan  [--territory=A,B]         dry run');
+    console.log('  apply [--territory=A,B]         write prices');
+    process.exit(command ? 1 : 0);
 }
-commandes[commande]().catch(e => { console.error('❌', e.message); process.exit(1); });
+commands[command]().catch(e => { console.error('❌', e.message); process.exit(1); });
