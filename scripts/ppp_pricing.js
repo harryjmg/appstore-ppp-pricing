@@ -122,8 +122,36 @@ const decode = id => JSON.parse(Buffer.from(id, 'base64').toString());
 /** Apple's price index is global: a price point ID can be forged for any product. */
 const forge = (sub, terr, p) => Buffer.from(JSON.stringify({ s: String(sub), t: terr, p: String(p) })).toString('base64').replace(/=+$/, '');
 
-const fetchJson = url => new Promise((res, rej) => {
-    https.get(url, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => { try { res(JSON.parse(d)); } catch (e) { rej(new Error('unreadable response')); } }); }).on('error', rej);
+/**
+ * The World Bank hands out an HTML error page under load, and https.get follows no
+ * redirect and checks no status code. All of it used to surface as "unreadable response",
+ * with no URL and no body — which sends you looking in the wrong place entirely.
+ * Retry the transient failures, and when the last attempt gives up, say what came back.
+ */
+const fetchJson = (url, tries = 3) => new Promise((res, rej) => {
+    const retry = (left, e) => {
+        if (left <= 1) return rej(e);
+        setTimeout(() => attempt(left - 1, url, 3), 1500 * (tries - left + 1));
+    };
+    const attempt = (left, target, hops) => {
+        https.get(target, { headers: { 'user-agent': 'appstore-ppp-pricing', accept: 'application/json' } }, r => {
+            if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location && hops > 0) {
+                r.resume();
+                return attempt(left, new URL(r.headers.location, target).toString(), hops - 1);
+            }
+            let d = '';
+            r.on('data', c => d += c);
+            r.on('end', () => {
+                try {
+                    if (r.statusCode < 200 || r.statusCode >= 300) throw new Error(`HTTP ${r.statusCode}`);
+                    res(JSON.parse(d.replace(/^\uFEFF/, '')));   // the API sometimes leads with a BOM
+                } catch (e) {
+                    retry(left, new Error(`${target.slice(0, 100)}… → ${e.message}; body: ${JSON.stringify(d.slice(0, 200))}`));
+                }
+            });
+        }).on('error', e => retry(left, e));
+    };
+    attempt(tries, url, 3);
 });
 
 // ───────────────────────────────────────────────────────────────── commands
