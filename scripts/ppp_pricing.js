@@ -154,15 +154,27 @@ async function cmdInit() {
         : (await getAll('/v1/territories?limit=200', jwt)).data.map(t => t.id);
 
     const countries = [...new Set([ref, ...territories])];
-    console.log(`World Bank — ${countries.length} territories…`);
+
+    // The World Bank rejects the entire request when a single code is unknown to it, and
+    // Apple sells in territories it doesn't track (Kosovo, Anguilla, the Vatican…). One bad
+    // code out of 175 therefore looked exactly like "no data for your reference country".
+    // Ask for its own country list first, and only ever query the intersection — the
+    // untracked territories fall through to the existing "skipped" count, untouched.
+    const known = new Set((((await fetchJson('https://api.worldbank.org/v2/country?format=json&per_page=400'))[1]) || []).map(c => c.id));
+    const queryable = countries.filter(c => known.has(c));
+    console.log(`World Bank — ${queryable.length} of ${countries.length} territories tracked…`);
+    if (!known.has(ref)) { console.error(`❌ the World Bank has no country ${ref} — check the ISO-3 code of your reference territory`); process.exit(1); }
 
     const indicator = async (code, mrv) => {
-        const r = await fetchJson(`https://api.worldbank.org/v2/country/${countries.join('%3B')}/indicator/${code}?format=json&mrv=${mrv}&per_page=2000`);
         const o = {};
-        for (const x of (r[1] || [])) {
-            if (x.value == null) continue;
-            const c = x.countryiso3code;
-            if (!o[c] || x.date > o[c].year) o[c] = { v: x.value, year: x.date, name: x.country.value };
+        for (let i = 0; i < queryable.length; i += 60) {   // keep the URL to a sane length
+            const batch = queryable.slice(i, i + 60).join('%3B');
+            const r = await fetchJson(`https://api.worldbank.org/v2/country/${batch}/indicator/${code}?format=json&mrv=${mrv}&per_page=2000`);
+            for (const x of (r[1] || [])) {
+                if (x.value == null) continue;
+                const c = x.countryiso3code;
+                if (!o[c] || x.date > o[c].year) o[c] = { v: x.value, year: x.date, name: x.country.value };
+            }
         }
         return o;
     };
