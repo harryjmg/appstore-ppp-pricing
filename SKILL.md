@@ -86,7 +86,31 @@ above it and they're out of market; well below and they're leaving money behind.
 
 ---
 
-## Decision 4 — Raising prices where purchasing power is higher
+## Decision 4 — Calculated price, or marketing price
+
+The index lands on a target, and the tool then picks the nearest available price point. On
+a target of 38.83 that gives **38.99** — a fine number that nonetheless reads like the
+output of a spreadsheet. **39.99** sits 3% away and is an anchor every buyer has seen a
+thousand times.
+
+Marketing rounding is **on by default** (`--no-marketing` to disable): within a tolerance,
+the tool prefers the strongest-reading price point over the strictly closest one.
+
+- **Leave it on** in most cases. The few percent of drift are well inside the margin of
+  error of the index itself — which rests on national statistics and a damping exponent,
+  not on a precise measurement of your buyers. Trading that for a price that reads properly
+  is a good deal.
+- **Turn it off** if you're deliberately positioning below a competitor's threshold, or if
+  you plan to compare markets precisely and want the drift out of the way.
+- **`--marketing-pull=8`** sets how far, in percent, snapping may drift. Raising it to 12
+  catches more anchors and costs more precision; lowering it to 4 keeps things tight.
+
+Note this pulls in both directions — it will round a target of 38.83 up to 39.99, and one
+of 41.20 down to 39.99. It doesn't systematically raise prices.
+
+---
+
+## Decision 5 — Raising prices where purchasing power is higher
 
 The maths is symmetrical: Switzerland, the US, Luxembourg, Ireland or Singapore come out
 above most reference markets. **Many developers apply only the decreases, out of caution, and
@@ -100,11 +124,11 @@ Make it an explicit decision. Two guardrails:
 - **The default cap is 1.30.** Beyond that they leave usual psychological price points and
   invite comparison between neighbouring markets.
 
-And above all: an increase touches **none** of their current subscribers — see decision 5.
+And above all: an increase touches **none** of their current subscribers — see decision 6.
 
 ---
 
-## Decision 5 — Their current subscribers
+## Decision 6 — Their current subscribers
 
 The question everyone worries about, and it has a clean answer: the API's
 `preserveCurrentPrice` attribute.
@@ -124,7 +148,7 @@ new ones in the same country. Few people, but it's a refund-request and dispute 
 
 ---
 
-## Decision 6 — The maintenance rhythm
+## Decision 7 — The maintenance rhythm
 
 Once a price is set manually, **Apple stops adjusting that territory**. On volatile
 currencies, net revenue erodes with nothing to raise the alarm.
@@ -157,6 +181,7 @@ included) and applies the index to it. No exchange rate is ever handled.
 ```bash
 node ppp_pricing.js products                              # 1. list subscriptions
 node ppp_pricing.js init --products=<id>,<id> --ref=USA   # 2. build the config
+                                                          #    (+ --no-marketing for strict PPP)
 node ppp_pricing.js plan                                  # 3. simulate — READ the table
 node ppp_pricing.js apply --territory=<one test country>  # 4. one canary territory
 node ppp_pricing.js apply                                 # 5. roll out

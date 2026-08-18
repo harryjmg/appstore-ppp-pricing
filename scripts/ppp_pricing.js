@@ -176,6 +176,7 @@ async function cmdInit() {
 
     const floor = parseFloat(opt('floor', '0.30'));
     const cap = parseFloat(opt('cap', '1.30'));
+    const marketing = !args.includes('--no-marketing');
 
     const out = {};
     let skipped = 0;
@@ -196,6 +197,7 @@ async function cmdInit() {
         reference: { territory: ref },
         bounds: { floor, cap, change_threshold_pct: 5, price_point_window_pct: 8 },
         preserve_current_price: true,
+        marketing_rounding: { enabled: marketing, pull_pct: parseFloat(opt('marketing-pull', '8')) },
         effective_date: null,
         plan_types: ['UPFRONT', 'MONTHLY'],
         subscriptions: products.map(id => ({ asc_id: id })),
@@ -207,24 +209,63 @@ async function cmdInit() {
 }
 
 /**
- * A price on a paywall has to look like a price: between two price points equally close to
- * the target, prefer the one that reads well. The penalty is expressed in relative-gap
- * points, so an ugly price only wins when it is markedly closer.
+ * How strong a price point reads on a paywall, 0 being strongest.
+ *
+ * Tier 0 is the familiar anchor — 9.99, 19.99, 39.99, or ₦20,900 — the shape people have
+ * seen a thousand times. Tier 1 is a .99 that isn't an anchor (38.99): tidy, but visibly
+ * the output of a calculation. Then the softer endings, then everything else.
  */
-function uglinessPenalty(price) {
-    const s = price.toFixed(2);
+function priceTier(price) {
+    // Currencies without decimals (JPY, IDR, NGN, VND…): trailing zeros are just scale,
+    // so strip them before judging. 299,000 reads as "299" and anchors like 2.99 does;
+    // 295,000 doesn't. Apple's own local grids also lean on the X900 / X990 shapes.
     if (Number.isInteger(price) && price >= 100) {
-        const e = String(price);
-        if (e.endsWith('999') || e.endsWith('900')) return 0;
-        if (e.endsWith('99') || e.endsWith('90') || e.endsWith('000')) return 0.005;
-        if (e.endsWith('9') || e.endsWith('0')) return 0.015;
-        return 0.05;
+        const raw = String(price);
+        const trimmed = raw.replace(/0+$/, '');
+        if (/99$/.test(trimmed) || /(900|990)$/.test(raw)) return 0;
+        if (/9$/.test(trimmed)) return 1;
+        if (/5$/.test(trimmed) || /(00|50)$/.test(raw)) return 2;
+        return 3;
     }
-    if (s.endsWith('.99')) return 0;
-    if (s.endsWith('.90') || s.endsWith('.95')) return 0.005;
-    if (s.endsWith('.49')) return 0.012;
-    if (s.endsWith('.00')) return 0.018;
-    return 0.05;
+    const whole = Math.floor(price);
+    const cents = Math.round((price - whole) * 100);
+    if (cents === 99) return whole % 10 === 9 ? 0 : 1;   // 39.99 anchors harder than 38.99
+    if (cents === 90 || cents === 95 || cents === 49 || cents === 50) return 2;
+    if (cents === 0) return whole % 10 === 0 ? 2 : 3;
+    return 3;
+}
+
+/**
+ * Pick the price point to write.
+ *
+ * With marketing rounding on, any point within `pull_pct` of the target is fair game and
+ * the strongest tier wins — so a target of 38.83 lands on 39.99 rather than 38.99. The
+ * few percent of drift are well inside the noise of the index itself, and the price reads
+ * like a price instead of like a conversion.
+ *
+ * With it off, the closest point wins, with only a light preference for tidy endings.
+ */
+function pickPricePoint(grid, target, cfg) {
+    const mk = cfg.marketing_rounding || {};
+    if (mk.enabled) {
+        const pull = (mk.pull_pct != null ? mk.pull_pct : 8) / 100;
+        let best = null;
+        for (const p of grid) {
+            const gap = Math.abs(p.px - target) / target;
+            if (gap > pull) continue;
+            const tier = priceTier(p.px);
+            if (!best || tier < best.tier || (tier === best.tier && gap < best.gap)) best = { p, tier, gap };
+        }
+        if (best) return best.p;   // sinon : rien d'assez proche, on retombe sur le plus proche
+    }
+    let pick = null, best = Infinity;
+    for (const p of grid) {
+        const gap = Math.abs(p.px - target) / target;
+        const penalty = gap <= (cfg.bounds.price_point_window_pct / 100) ? priceTier(p.px) * 0.006 : 0;
+        const score = gap + penalty;
+        if (score < best) { best = score; pick = p; }
+    }
+    return pick;
 }
 
 async function buildPlan(jwt, cfg) {
@@ -276,12 +317,7 @@ async function buildPlan(jwt, cfg) {
                 }
                 if (!grid.length) continue;
 
-                let pick = null, best = Infinity;
-                for (const p of grid) {
-                    const gap = Math.abs(p.px - target) / target;
-                    const score = gap + (gap <= cfg.bounds.price_point_window_pct / 100 ? uglinessPenalty(p.px) : 0);
-                    if (score < best) { best = score; pick = p; }
-                }
+                const pick = pickPricePoint(grid, target, cfg);
 
                 const now = (current[terr] || {})[planType];
                 const delta = now ? (pick.px - now.price) / now.price * 100 : null;
@@ -356,6 +392,9 @@ if (!commands[command]) {
     console.log('  init --products=id,id --ref=USA build ppp_config.json');
     console.log('       [--territories=all|A,B]    default: every App Store territory');
     console.log('       [--floor=0.30 --cap=1.30]');
+    console.log('       [--no-marketing]           keep the closest price point instead of');
+    console.log('                                  snapping to a familiar anchor (39.99 vs 38.99)');
+    console.log('       [--marketing-pull=8]       how far, in %, snapping may drift');
     console.log('  plan  [--territory=A,B]         dry run');
     console.log('  apply [--territory=A,B]         write prices');
     process.exit(command ? 1 : 0);

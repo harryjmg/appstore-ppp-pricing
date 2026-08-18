@@ -41,31 +41,34 @@ rates, the tool asks Apple for the `equalization` of your reference price: the e
 price Apple itself would set in each territory, local taxes and psychological rounding
 included. The index is applied on top of that.
 
-**3. A real price point.** Apple only accepts about 800 values per territory. The tool picks
-the closest to target, preferring the ones that read like a price: `29.99` wins over `30.14`
-at comparable distance, and `₦20,900` over `₦21,013`.
+**3. A real price point — one that reads like a price.** Apple only accepts about 800 values
+per territory. A target of 38.83 has 38.99 sitting right next to it, but 39.99 is 3% away and
+is an anchor every buyer has seen a thousand times. By default the tool snaps to the
+strongest-reading point within tolerance rather than the strictly closest one — in both
+directions, so 41.20 also lands on 39.99. `--no-marketing` keeps strict PPP,
+`--marketing-pull=8` sets the tolerance.
 
 **4. Writing, after simulation.** `plan` never writes anything and prints the full
 before/after table. `apply` pushes the prices, retrying transient API errors.
 
 Worked example, reference United States at $39.99/year — indices are real World Bank figures,
-"Apple default" is Apple's own conversion:
+"Apple default" is Apple's own conversion, and marketing rounding is on:
 
 | Territory | Apple default | PPP-adjusted | Index |
 |---|---|---|---|
 | United States (reference) | 39.99 USD | — | 1.00 |
-| Germany | 44.99 EUR | **38.99 EUR** | 0.86 |
+| Germany | 44.99 EUR | **39.99 EUR** | 0.86 |
 | United Kingdom | 39.99 GBP | **29.99 GBP** | 0.76 |
 | Türkiye | 1999.99 TRY | **1499.99 TRY** | 0.75 |
-| Japan | 6000 JPY | **4290 JPY** | 0.72 |
-| Poland | 199.99 PLN | **131.99 PLN** | 0.66 |
-| Brazil | 249.90 BRL | **142.90 BRL** | 0.57 |
-| Mexico | 899 MXN | **490 MXN** | 0.55 |
+| Japan | 6000 JPY | **3990 JPY** | 0.72 |
+| Poland | 199.99 PLN | **129.99 PLN** | 0.66 |
+| Brazil | 249.90 BRL | **139 BRL** | 0.57 |
+| Mexico | 899 MXN | **499 MXN** | 0.55 |
 | South Africa | 799.99 ZAR | **389.99 ZAR** | 0.49 |
-| Indonesia | 699000 IDR | **295000 IDR** | 0.42 |
-| Vietnam | 1199000 VND | **500000 VND** | 0.42 |
-| Philippines | 2490 PHP | **1020 PHP** | 0.41 |
-| India | 3999 INR | **1239 INR** | 0.31 |
+| Indonesia | 699000 IDR | **299000 IDR** | 0.42 |
+| Vietnam | 1199000 VND | **499000 VND** | 0.42 |
+| Philippines | 2490 PHP | **999 PHP** | 0.41 |
+| India | 3999 INR | **1199 INR** | 0.31 |
 | Nigeria | 69900 NGN | **20900 NGN** | 0.30 (floor) |
 
 ## Install
@@ -87,6 +90,7 @@ anything is written — in your own language.
 cd scripts
 node ppp_pricing.js products                              # list your subscriptions
 node ppp_pricing.js init --products=<id>,<id> --ref=USA   # build the config
+node ppp_pricing.js init --products=<id> --ref=USA --no-marketing   # ... in strict PPP
 node ppp_pricing.js plan                                  # dry run — writes nothing
 node ppp_pricing.js apply                                 # write
 ```
@@ -114,7 +118,7 @@ The bundled `.gitignore` keeps the key and config out of git. Check it before yo
 
 ## The decisions that determine the outcome
 
-The code is the easy part. [`SKILL.md`](SKILL.md) covers the six trade-offs:
+The code is the easy part. [`SKILL.md`](SKILL.md) covers the seven trade-offs:
 
 1. **Whether it's worth it for you.** If one country is 90% of your installs, this is the
    precondition for opening a market, not an immediate gain. Knowing that keeps you from
@@ -124,11 +128,13 @@ The code is the easy part. [`SKILL.md`](SKILL.md) covers the six trade-offs:
    declined.
 3. **How low to go.** Where to set the floor, and how to calibrate it against a real
    comparable rather than theory.
-4. **Whether to raise prices** where purchasing power exceeds your reference market. Most
+4. **Calculated price or marketing price.** Whether to snap to familiar anchors, and how far
+   you'll let that drift from the computed target.
+5. **Whether to raise prices** where purchasing power exceeds your reference market. Most
    people don't dare.
-5. **Your existing subscribers.** One API boolean protects them completely — no need to
+6. **Your existing subscribers.** One API boolean protects them completely — no need to
    create new products, which is the common and costly reflex.
-6. **Maintenance.** Once a price is set manually, Apple stops adjusting that territory.
+7. **Maintenance.** Once a price is set manually, Apple stops adjusting that territory.
 
 ## Three App Store Connect API gotchas
 
