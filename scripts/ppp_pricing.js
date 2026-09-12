@@ -166,15 +166,38 @@ async function cmdProducts() {
             console.log(`  ${s.id}  ${(s.attributes.productId || '').padEnd(28)} ${s.attributes.subscriptionPeriod || ''}  ${s.attributes.state}`);
         }
     }
-    console.log('\nKeep only the products your paywall actually sells.');
-    console.log('Then: node ppp_pricing.js init --products=<id>,<id> --ref=USA');
+    console.log('\nAll approved subscriptions are priced by default.');
+    console.log('Then: node ppp_pricing.js run --ref=<ISO3>');
+}
+
+/** Every subscription Apple has approved — what `--products` defaults to. */
+async function approuves(jwt, appId) {
+    const out = [];
+    const groups = await getAll(`/v1/apps/${appId}/subscriptionGroups?limit=50`, jwt);
+    for (const g of groups.data) {
+        const subs = await getAll(`/v1/subscriptionGroups/${g.id}/subscriptions?limit=200`, jwt);
+        for (const x of subs.data) if (x.attributes.state === 'APPROVED') out.push({ id: x.id, productId: x.attributes.productId });
+    }
+    return out;
 }
 
 async function cmdInit() {
-    const { jwt } = token();
-    const products = (opt('products') || '').split(',').filter(Boolean);
+    const { jwt, cfg: asc } = token();
     const ref = opt('ref', 'USA');
-    if (!products.length) { console.error('❌ --products=<ascId>,<ascId> is required (see: node ppp_pricing.js products)'); process.exit(1); }
+
+    // Asking which products to price was the first question this skill used to ask, and it
+    // is the one the user is least able to answer — product ids are opaque, and the answer
+    // is nearly always "the ones Apple has approved". So default to those and SAY so. The
+    // trap decision 2 warns about is not choosing wrongly, it is forgetting a product
+    // entirely; defaulting to all of them is the safe side of that mistake.
+    let products = (opt('products') || '').split(',').filter(Boolean);
+    if (!products.length) {
+        const found = await approuves(jwt, asc.app_id);
+        if (!found.length) { console.error('❌ no approved subscription on this app — check the API key\'s app, or pass --products='); process.exit(1); }
+        products = found.map(f => f.id);
+        console.log(`Pricing every approved subscription (--products= to narrow):`);
+        for (const f of found) console.log(`   ${f.id}  ${f.productId}`);
+    }
 
     const asked = opt('territories');
     const territories = asked && asked !== 'all'
@@ -316,6 +339,7 @@ async function buildPlan(jwt, cfg, restrict = null) {
     const only = restrict || (opt('territory') ? opt('territory').split(',') : null);
     const rows = [];
     const unpriced = new Set();
+    const allCohorts = [];
 
     for (const sub of cfg.subscriptions) {
         if (sub.skip) { console.log(`⏭️  ${sub.asc_id} skipped — ${sub.skip}`); continue; }
@@ -324,15 +348,47 @@ async function buildPlan(jwt, cfg, restrict = null) {
             `/v1/subscriptions/${sub.asc_id}/prices?limit=200&include=subscriptionPricePoint,territory`, jwt);
         const points = {};
         for (const i of included) if (i.type === 'subscriptionPricePoints') points[i.id] = i.attributes;
-        const current = {};
+
+        // A price is not a value, it is a SCHEDULE — and `/prices` hands you the whole of it
+        // at once, undocumented. The old code looped and kept whichever record came last,
+        // which made this tool unable to tell three different situations apart.
+        //
+        // Two attributes sort them out:
+        //
+        //   preserved: true   a FROZEN COHORT. `preserveCurrentPrice` on an increase leaves
+        //                     existing subscribers behind, and Apple records that as a price
+        //                     with no startDate. It is never what a new buyer pays — reading
+        //                     it as "the current price" makes every increase you ever shipped
+        //                     look like it silently failed. It didn't; you just read the
+        //                     wrong row.
+        //   preserved: false  the SALE PRICE. Undated or past-dated, it is in force today;
+        //                     the nearest future date is what replaces it.
+        //
+        // So: the sale price is the latest unpreserved record that has already started, and
+        // anything still ahead is pending. Nothing here is in Apple's documentation; it is
+        // read off real accounts, and it is the difference between verifying a rollout and
+        // guessing at one.
+        const today = new Date().toISOString().slice(0, 10);
+        const current = {}, scheduled = {}, cohorts = [];
         for (const p of data) {
             const t = p.relationships.territory.data.id;
-            const pp = points[p.relationships.subscriptionPricePoint.data.id] || {};
-            (current[t] = current[t] || {})[p.attributes.planType] = {
-                price: parseFloat(pp.customerPrice),
+            const plan = p.attributes.planType;
+            const start = p.attributes.startDate;
+            const rec = {
+                price: parseFloat((points[p.relationships.subscriptionPricePoint.data.id] || {}).customerPrice),
                 pricePointId: p.relationships.subscriptionPricePoint.data.id,
+                startDate: start,
             };
+            if (p.attributes.preserved) { cohorts.push({ subId: sub.asc_id, territory: t, planType: plan, ...rec }); continue; }
+            if (start && start > today) {
+                const sc = (scheduled[t] = scheduled[t] || {});
+                if (!sc[plan] || start < sc[plan].startDate) sc[plan] = rec;      // the nearest one wins
+            } else {
+                const cu = (current[t] = current[t] || {});
+                if (!cu[plan] || (start || '') > (cu[plan].startDate || '')) cu[plan] = rec;
+            }
         }
+        allCohorts.push(...cohorts);
         if (!current[ref]) throw new Error(`${sub.asc_id}: no price on reference territory ${ref}`);
 
         for (const planType of cfg.plan_types) {
@@ -365,18 +421,24 @@ async function buildPlan(jwt, cfg, restrict = null) {
                 const pick = pickPricePoint(grid, target, cfg);
 
                 const now = (current[terr] || {})[planType];
+                const prog = (scheduled[terr] || {})[planType];
                 const delta = now ? (pick.px - now.price) / now.price * 100 : null;
+                // Already scheduled at the right price: leave it alone. Without this, a
+                // rollout re-run during the three-day wait stacks duplicate writes, and
+                // a cron re-run does it every quarter.
+                const alreadyScheduled = prog != null && Math.abs(prog.price - pick.px) < 1e-6;
                 rows.push({
                     subId: sub.asc_id, planType, territory: terr, index: conf.index, bound: conf.bound,
                     currentPrice: now ? now.price : null, newPrice: pick.px, target, delta,
+                    scheduledPrice: prog ? prog.price : null, scheduledFor: prog ? prog.startDate : null,
                     pricePointId: forge(sub.asc_id, terr, pick.p),
-                    change: delta != null && Math.abs(delta) >= cfg.bounds.change_threshold_pct,
+                    change: !alreadyScheduled && delta != null && Math.abs(delta) >= cfg.bounds.change_threshold_pct,
                 });
             }
         }
     }
     fs.writeFileSync(CACHE, JSON.stringify(cache));
-    return { rows, unpriced: [...unpriced] };
+    return { rows, unpriced: [...unpriced], cohorts: allCohorts };
 }
 
 async function cmdPlan(write, restrict = null) {
@@ -488,11 +550,27 @@ function cmdBounds() {
 async function cmdVerify() {
     const cfg = readCfg();
     const { jwt } = token();
-    const { rows, unpriced } = await buildPlan(jwt, cfg);
+    const { rows, unpriced, cohorts } = await buildPlan(jwt, cfg);
+
+    // Three states, because "on target" alone cannot tell a finished rollout from one that
+    // is merely written. Apple applies a price on its startDate, never before, so for three
+    // days after every run the honest answer is "written, waiting" — and a verify that says
+    // "still to write" there sends you re-running a rollout you already did.
+    const live = rows.filter(r => !r.change && !r.scheduledFor);
+    const waiting = rows.filter(r => !r.change && r.scheduledFor);
     const pending = rows.filter(r => r.change);
-    console.log(`${rows.length - pending.length} of ${rows.length} price(s) on target.`);
+
+    console.log(`${live.length} in force · ${waiting.length} written and waiting · ${pending.length} still to write`);
+    if (waiting.length) {
+        const dates = [...new Set(waiting.map(r => r.scheduledFor))].sort();
+        console.log(`   takes effect ${dates.join(', ')} — nothing to do until then.`);
+    }
     for (const r of pending) {
         console.log(`   ${r.territory.padEnd(5)} ${r.planType.toLowerCase().padEnd(8)} ${String(r.currentPrice).padStart(10)} → ${String(r.newPrice).padStart(10)}  still to write`);
+    }
+    if (cohorts.length) {
+        console.log(`\n${cohorts.length} frozen cohort price(s) — existing subscribers left on an older price by`);
+        console.log('   preserveCurrentPrice. Informational: these are not what new buyers pay.');
     }
     if (unpriced.length) console.log(`\n⚠️  ${unpriced.length} territory(ies) Apple cannot price: ${unpriced.join(', ')}`);
     if (pending.length) process.exitCode = 1;
