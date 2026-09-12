@@ -166,15 +166,38 @@ async function cmdProducts() {
             console.log(`  ${s.id}  ${(s.attributes.productId || '').padEnd(28)} ${s.attributes.subscriptionPeriod || ''}  ${s.attributes.state}`);
         }
     }
-    console.log('\nKeep only the products your paywall actually sells.');
-    console.log('Then: node ppp_pricing.js init --products=<id>,<id> --ref=USA');
+    console.log('\nAll approved subscriptions are priced by default.');
+    console.log('Then: node ppp_pricing.js run --ref=<ISO3>');
+}
+
+/** Every subscription Apple has approved — what `--products` defaults to. */
+async function approuves(jwt, appId) {
+    const out = [];
+    const groups = await getAll(`/v1/apps/${appId}/subscriptionGroups?limit=50`, jwt);
+    for (const g of groups.data) {
+        const subs = await getAll(`/v1/subscriptionGroups/${g.id}/subscriptions?limit=200`, jwt);
+        for (const x of subs.data) if (x.attributes.state === 'APPROVED') out.push({ id: x.id, productId: x.attributes.productId });
+    }
+    return out;
 }
 
 async function cmdInit() {
-    const { jwt } = token();
-    const products = (opt('products') || '').split(',').filter(Boolean);
+    const { jwt, cfg: asc } = token();
     const ref = opt('ref', 'USA');
-    if (!products.length) { console.error('❌ --products=<ascId>,<ascId> is required (see: node ppp_pricing.js products)'); process.exit(1); }
+
+    // Asking which products to price was the first question this skill used to ask, and it
+    // is the one the user is least able to answer — product ids are opaque, and the answer
+    // is nearly always "the ones Apple has approved". So default to those and SAY so. The
+    // trap decision 2 warns about is not choosing wrongly, it is forgetting a product
+    // entirely; defaulting to all of them is the safe side of that mistake.
+    let products = (opt('products') || '').split(',').filter(Boolean);
+    if (!products.length) {
+        const found = await approuves(jwt, asc.app_id);
+        if (!found.length) { console.error('❌ no approved subscription on this app — check the API key\'s app, or pass --products='); process.exit(1); }
+        products = found.map(f => f.id);
+        console.log(`Pricing every approved subscription (--products= to narrow):`);
+        for (const f of found) console.log(`   ${f.id}  ${f.productId}`);
+    }
 
     const asked = opt('territories');
     const territories = asked && asked !== 'all'
@@ -227,6 +250,7 @@ async function cmdInit() {
         const damped = Math.sqrt((gni[t].v * share) / baseline);
         out[t] = {
             index: Number(Math.min(cap, Math.max(floor, damped)).toFixed(3)),
+            damped: Number(damped.toFixed(4)),   // unclamped: lets `bounds` replay offline
             gni_ppp: gni[t].v, top_decile_share: share,
             decile_source: decile[t] ? String(decile[t].year) : 'fallback',
             bound: damped < floor ? 'floor' : damped > cap ? 'cap' : null,
@@ -240,6 +264,7 @@ async function cmdInit() {
         marketing_rounding: { enabled: marketing, pull_pct: parseFloat(opt('marketing-pull', '8')) },
         effective_date: null,
         plan_types: ['UPFRONT', 'MONTHLY'],
+        frozen: [],
         subscriptions: products.map(id => ({ asc_id: id })),
         territories: out,
     };
@@ -308,11 +333,13 @@ function pickPricePoint(grid, target, cfg) {
     return pick;
 }
 
-async function buildPlan(jwt, cfg) {
+async function buildPlan(jwt, cfg, restrict = null) {
     const cache = fs.existsSync(CACHE) ? JSON.parse(fs.readFileSync(CACHE, 'utf8')) : {};
     const ref = cfg.reference.territory;
-    const only = opt('territory') ? opt('territory').split(',') : null;
+    const only = restrict || (opt('territory') ? opt('territory').split(',') : null);
     const rows = [];
+    const unpriced = new Set();
+    const allCohorts = [];
 
     for (const sub of cfg.subscriptions) {
         if (sub.skip) { console.log(`⏭️  ${sub.asc_id} skipped — ${sub.skip}`); continue; }
@@ -321,15 +348,47 @@ async function buildPlan(jwt, cfg) {
             `/v1/subscriptions/${sub.asc_id}/prices?limit=200&include=subscriptionPricePoint,territory`, jwt);
         const points = {};
         for (const i of included) if (i.type === 'subscriptionPricePoints') points[i.id] = i.attributes;
-        const current = {};
+
+        // A price is not a value, it is a SCHEDULE — and `/prices` hands you the whole of it
+        // at once, undocumented. The old code looped and kept whichever record came last,
+        // which made this tool unable to tell three different situations apart.
+        //
+        // Two attributes sort them out:
+        //
+        //   preserved: true   a FROZEN COHORT. `preserveCurrentPrice` on an increase leaves
+        //                     existing subscribers behind, and Apple records that as a price
+        //                     with no startDate. It is never what a new buyer pays — reading
+        //                     it as "the current price" makes every increase you ever shipped
+        //                     look like it silently failed. It didn't; you just read the
+        //                     wrong row.
+        //   preserved: false  the SALE PRICE. Undated or past-dated, it is in force today;
+        //                     the nearest future date is what replaces it.
+        //
+        // So: the sale price is the latest unpreserved record that has already started, and
+        // anything still ahead is pending. Nothing here is in Apple's documentation; it is
+        // read off real accounts, and it is the difference between verifying a rollout and
+        // guessing at one.
+        const today = new Date().toISOString().slice(0, 10);
+        const current = {}, scheduled = {}, cohorts = [];
         for (const p of data) {
             const t = p.relationships.territory.data.id;
-            const pp = points[p.relationships.subscriptionPricePoint.data.id] || {};
-            (current[t] = current[t] || {})[p.attributes.planType] = {
-                price: parseFloat(pp.customerPrice),
+            const plan = p.attributes.planType;
+            const start = p.attributes.startDate;
+            const rec = {
+                price: parseFloat((points[p.relationships.subscriptionPricePoint.data.id] || {}).customerPrice),
                 pricePointId: p.relationships.subscriptionPricePoint.data.id,
+                startDate: start,
             };
+            if (p.attributes.preserved) { cohorts.push({ subId: sub.asc_id, territory: t, planType: plan, ...rec }); continue; }
+            if (start && start > today) {
+                const sc = (scheduled[t] = scheduled[t] || {});
+                if (!sc[plan] || start < sc[plan].startDate) sc[plan] = rec;      // the nearest one wins
+            } else {
+                const cu = (current[t] = current[t] || {});
+                if (!cu[plan] || (start || '') > (cu[plan].startDate || '')) cu[plan] = rec;
+            }
         }
+        allCohorts.push(...cohorts);
         if (!current[ref]) throw new Error(`${sub.asc_id}: no price on reference territory ${ref}`);
 
         for (const planType of cfg.plan_types) {
@@ -343,7 +402,9 @@ async function buildPlan(jwt, cfg) {
             for (const e of eq.data) base[decode(e.id).t] = parseFloat(e.attributes.customerPrice);
 
             for (const [terr, conf] of Object.entries(cfg.territories)) {
-                if (base[terr] == null) continue;
+                // Apple returns no equalization for a territory it cannot sell this product
+                // in. Silently skipping it is how you end up believing a country is covered.
+                if (base[terr] == null) { unpriced.add(terr); continue; }
                 if (only && !only.includes(terr)) continue;
                 const target = base[terr] * conf.index;
 
@@ -360,29 +421,34 @@ async function buildPlan(jwt, cfg) {
                 const pick = pickPricePoint(grid, target, cfg);
 
                 const now = (current[terr] || {})[planType];
+                const prog = (scheduled[terr] || {})[planType];
                 const delta = now ? (pick.px - now.price) / now.price * 100 : null;
+                // Already scheduled at the right price: leave it alone. Without this, a
+                // rollout re-run during the three-day wait stacks duplicate writes, and
+                // a cron re-run does it every quarter.
+                const alreadyScheduled = prog != null && Math.abs(prog.price - pick.px) < 1e-6;
                 rows.push({
                     subId: sub.asc_id, planType, territory: terr, index: conf.index, bound: conf.bound,
                     currentPrice: now ? now.price : null, newPrice: pick.px, target, delta,
+                    scheduledPrice: prog ? prog.price : null, scheduledFor: prog ? prog.startDate : null,
                     pricePointId: forge(sub.asc_id, terr, pick.p),
-                    change: delta != null && Math.abs(delta) >= cfg.bounds.change_threshold_pct,
+                    change: !alreadyScheduled && delta != null && Math.abs(delta) >= cfg.bounds.change_threshold_pct,
                 });
             }
         }
     }
     fs.writeFileSync(CACHE, JSON.stringify(cache));
-    return rows;
+    return { rows, unpriced: [...unpriced], cohorts: allCohorts };
 }
 
-async function cmdPlan(write) {
-    if (!fs.existsSync(PPP_CONFIG)) { console.error('❌ ppp_config.json is missing. Run: node ppp_pricing.js init'); process.exit(1); }
-    const cfg = JSON.parse(fs.readFileSync(PPP_CONFIG, 'utf8'));
+async function cmdPlan(write, restrict = null) {
+    const cfg = readCfg();
     const { jwt } = token();
 
     console.log(write ? '🔴 WRITING' : '🔵 Dry run — nothing will be written');
     console.log(`   reference ${cfg.reference.territory} · existing subscribers: ${cfg.preserve_current_price ? 'price preserved' : '⚠️ NOT preserved'}\n`);
 
-    const rows = await buildPlan(jwt, cfg);
+    const { rows, unpriced } = await buildPlan(jwt, cfg, restrict);
     const todo = rows.filter(r => r.change).sort((a, b) => b.delta - a.delta);
 
     for (const r of todo) {
@@ -390,12 +456,19 @@ async function cmdPlan(write) {
         console.log(`   ${r.territory.padEnd(5)} ${r.planType.toLowerCase().padEnd(8)} ${String(r.currentPrice).padStart(10)} → ${String(r.newPrice).padStart(10)} ${d.padStart(7)}   ×${r.index}${r.bound ? ' (' + r.bound + ')' : ''}`);
     }
     console.log(`\n${todo.length} price(s) to write · ${todo.filter(r => r.delta > 0).length} increase(s) · ${todo.filter(r => r.delta < 0).length} decrease(s)`);
+    if (unpriced.length) {
+        console.log(`\n⚠️  ${unpriced.length} territory(ies) in your config have no Apple price equalization`);
+        console.log(`   and can never be written — Apple doesn't sell this product there: ${unpriced.join(', ')}`);
+    }
 
     if (!write) { console.log('\nNothing was changed. Re-run with "apply" once the plan looks right.'); return; }
 
     // Three attributes, and all three matter — see SKILL.md.
-    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
-    const startDate = cfg.effective_date || tomorrow;
+    // "At least one day in the future" is what the error message implies, and it is wrong:
+    // tomorrow is rejected with 409 ENTITY_ERROR.RELATIONSHIP.INVALID, "Invalid startDate".
+    // Three days out is accepted. The old default therefore failed every single write.
+    const soon = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
+    const startDate = cfg.effective_date || soon;
     let ok = 0, failed = 0;
     for (const r of todo) {
         const res = await call('POST', '/v1/subscriptionPrices', jwt, {
@@ -411,7 +484,7 @@ async function cmdPlan(write) {
         if (res.s === 200 || res.s === 201) { ok++; process.stdout.write('.'); }
         else {
             failed++;
-            console.log(`\n❌ ${r.subId} ${r.territory} ${r.planType} → ${res.s} ${JSON.stringify(res.d).slice(0, 240)}`);
+            console.log(`\n❌ ${r.subId} ${r.territory} ${r.planType} → ${res.s} ${JSON.stringify(res.d).slice(0, 600)}`);
             if (res.s === 403) { console.error('\nThis key cannot write prices: App Manager or Admin role required.'); break; }
         }
         await new Promise(s => setTimeout(s, 250));
@@ -419,15 +492,139 @@ async function cmdPlan(write) {
     console.log(`\n\n✅ ${ok} written${failed ? ` · ❌ ${failed} failed` : ''} — effective ${startDate}`);
 }
 
+function readCfg() {
+    if (!fs.existsSync(PPP_CONFIG)) { console.error('❌ ppp_config.json is missing. Run: node ppp_pricing.js init'); process.exit(1); }
+    return JSON.parse(fs.readFileSync(PPP_CONFIG, 'utf8'));
+}
+
+/**
+ * Re-clamp every index from the unclamped value stored at init.
+ *
+ * A floor, a cap and a freeze are decisions, not measurements. Replaying one shouldn't
+ * mean asking the World Bank again — and above all shouldn't drop the territories someone
+ * added by hand, which is precisely what re-running `init` does.
+ */
+function reindex(cfg) {
+    const { floor, cap } = cfg.bounds;
+    const frozen = new Set(cfg.frozen || []);
+    let manual = 0;
+    for (const [t, v] of Object.entries(cfg.territories)) {
+        if (frozen.has(t)) { v.index = 1; v.bound = 'frozen'; continue; }
+        if (v.damped == null) { manual++; continue; }   // hand-written: left exactly as found
+        v.index = Number(Math.min(cap, Math.max(floor, v.damped)).toFixed(3));
+        v.bound = v.damped < floor ? 'floor' : v.damped > cap ? 'cap' : null;
+    }
+    return { manual, frozen: frozen.size };
+}
+
+/**
+ * Move the bounds without touching the network. The decisions that actually shape the
+ * outcome — how low, how high, which territories never move — are the ones you revise
+ * three times while reading the table, so they must cost a second, not a re-index.
+ */
+function cmdBounds() {
+    const cfg = readCfg();
+    if (opt('floor') != null) cfg.bounds.floor = parseFloat(opt('floor'));
+    if (opt('cap') != null) cfg.bounds.cap = parseFloat(opt('cap'));
+    if (args.includes('--no-increases')) cfg.bounds.cap = 1;
+    const freeze = opt('freeze');
+    if (freeze != null) {
+        cfg.frozen = freeze === 'none' ? []
+            : [...new Set([...(cfg.frozen || []), ...freeze.split(',').filter(Boolean)])];
+    }
+    const { manual, frozen } = reindex(cfg);
+    fs.writeFileSync(PPP_CONFIG, JSON.stringify(cfg, null, 2));
+
+    const v = Object.values(cfg.territories);
+    console.log(`✅ floor ${cfg.bounds.floor} · cap ${cfg.bounds.cap} · ${v.filter(x => x.bound === 'floor').length} at the floor · `
+        + `${v.filter(x => x.bound === 'cap').length} at the cap · ${frozen} frozen`
+        + (manual ? ` · ${manual} hand-written, left as is` : ''));
+    console.log('   Then: node ppp_pricing.js plan');
+}
+
+/**
+ * Read the prices back. A dot on stdout is not proof that Apple stored anything —
+ * this is. Exits non-zero while anything is still off target, so the quarterly cron
+ * the skill asks for can actually fail.
+ */
+async function cmdVerify() {
+    const cfg = readCfg();
+    const { jwt } = token();
+    const { rows, unpriced, cohorts } = await buildPlan(jwt, cfg);
+
+    // Three states, because "on target" alone cannot tell a finished rollout from one that
+    // is merely written. Apple applies a price on its startDate, never before, so for three
+    // days after every run the honest answer is "written, waiting" — and a verify that says
+    // "still to write" there sends you re-running a rollout you already did.
+    const live = rows.filter(r => !r.change && !r.scheduledFor);
+    const waiting = rows.filter(r => !r.change && r.scheduledFor);
+    const pending = rows.filter(r => r.change);
+
+    console.log(`${live.length} in force · ${waiting.length} written and waiting · ${pending.length} still to write`);
+    if (waiting.length) {
+        const dates = [...new Set(waiting.map(r => r.scheduledFor))].sort();
+        console.log(`   takes effect ${dates.join(', ')} — nothing to do until then.`);
+    }
+    for (const r of pending) {
+        console.log(`   ${r.territory.padEnd(5)} ${r.planType.toLowerCase().padEnd(8)} ${String(r.currentPrice).padStart(10)} → ${String(r.newPrice).padStart(10)}  still to write`);
+    }
+    if (cohorts.length) {
+        console.log(`\n${cohorts.length} frozen cohort price(s) — existing subscribers left on an older price by`);
+        console.log('   preserveCurrentPrice. Informational: these are not what new buyers pay.');
+    }
+    if (unpriced.length) console.log(`\n⚠️  ${unpriced.length} territory(ies) Apple cannot price: ${unpriced.join(', ')}`);
+    if (pending.length) process.exitCode = 1;
+}
+
+/**
+ * Build, bound and simulate in one call. Every decision is a flag, so nothing stops
+ * halfway to ask a question — this is the form an agent can drive end to end instead
+ * of handing you five commands to type.
+ *
+ * `run` never writes, and that is the point: a command that cannot write can be granted
+ * once and for all, while `rollout` stays a deliberate act. Splitting them is what makes
+ * "hands-off up to the plan, hands-on to write" expressible as a permission rule.
+ */
+async function cmdRun() {
+    if (!fs.existsSync(PPP_CONFIG) || args.includes('--fresh')) await cmdInit();
+    else console.log('ppp_config.json already exists — reusing it (--fresh rebuilds it).');
+
+    if (['floor', 'cap', 'freeze'].some(f => opt(f) != null) || args.includes('--no-increases')) cmdBounds();
+
+    await cmdPlan(false);
+    console.log('\nRead the table. Then: node ppp_pricing.js rollout --canary=<territory>');
+}
+
+/** Write: one canary territory, then the rest, then read the prices back. */
+async function cmdRollout() {
+    const canary = opt('canary');
+    if (canary) {
+        console.log(`── canary: ${canary} ──`);
+        await cmdPlan(true, [canary]);
+        console.log('\n── rolling out ──');
+    }
+    await cmdPlan(true);
+    await cmdVerify();
+}
+
 const commands = {
     products: cmdProducts,
     init: cmdInit,
+    bounds: cmdBounds,
     plan: () => cmdPlan(false),
     apply: () => cmdPlan(true),
+    verify: cmdVerify,
+    run: cmdRun,
+    rollout: cmdRollout,
 };
 
 if (!commands[command]) {
-    console.log('Usage: node ppp_pricing.js <products|init|plan|apply> [options]');
+    console.log('Usage: node ppp_pricing.js <run|rollout|products|init|bounds|plan|apply|verify> [options]');
+    console.log('  run   --products=id,id --ref=USA   build + bound + simulate. Never writes.');
+    console.log('        [--floor= --cap= --freeze=]  decisions, applied before the plan');
+    console.log('        [--fresh]                    rebuild the config from scratch');
+    console.log('  rollout [--canary=XXX]          write: one territory first, then the rest,');
+    console.log('                                  then read the prices back');
     console.log('  products                        list the account\'s subscriptions');
     console.log('  init --products=id,id --ref=USA build ppp_config.json');
     console.log('       [--territories=all|A,B]    default: every App Store territory');
@@ -435,8 +632,13 @@ if (!commands[command]) {
     console.log('       [--no-marketing]           keep the closest price point instead of');
     console.log('                                  snapping to a familiar anchor (39.99 vs 38.99)');
     console.log('       [--marketing-pull=8]       how far, in %, snapping may drift');
+    console.log('  bounds [--floor= --cap=]        replay the bounds offline, keeping');
+    console.log('         [--freeze=A,B|none]      hand-written territories intact');
+    console.log('         [--no-increases]         cap at 1.0: nothing goes up');
     console.log('  plan  [--territory=A,B]         dry run');
     console.log('  apply [--territory=A,B]         write prices');
+    console.log('  verify                          read the prices back; non-zero if off target');
     process.exit(command ? 1 : 0);
 }
-commands[command]().catch(e => { console.error('❌', e.message); process.exit(1); });
+// bounds is synchronous; wrap so the dispatch doesn't depend on which ones are async.
+Promise.resolve(commands[command]()).catch(e => { console.error('❌', e.message); process.exit(1); });

@@ -1,5 +1,7 @@
-# Ne jamais committer : clé privée App Store Connect et configuration locale
+# Never commit: store credentials, local config, local caches
 *.p8
 asc_api_config.json
-ppp_config.json
+ppp_config.json*
 .ppp_grid_cache.json
+play_config.json
+play-service-account.json
